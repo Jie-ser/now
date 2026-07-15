@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.cache/
+.venv/
+venv/
+env/
+*.log
+
+# output files
+*.mp4
+*.mov
+*.avi
+*.gif
+
+# model files
+*.safetensors
+*.pth
+*.ckpt
+*.bin
+
+# hf cache
+.hf-home/
