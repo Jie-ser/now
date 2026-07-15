@@ -75,6 +75,19 @@ def save_case(candidates, rewards, best_idx, image_path, prompt, output_dir, cfg
     logger.info("Saved %d candidates to %s", len(candidates), case_dir)
 
 
+def find_input_image(input_dir, name):
+    """Return the supported image file for a test name, regardless of suffix."""
+    for suffix in (".png", ".jpg", ".jpeg"):
+        candidate = input_dir / f"{name}{suffix}"
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"Input image not found for {name}; expected one of "
+        f"{input_dir / (name + '.png')}, {input_dir / (name + '.jpg')}, "
+        f"or {input_dir / (name + '.jpeg')}"
+    )
+
+
 def main():
     args = parse_args()
     if args.start < 1 or args.end < args.start:
@@ -97,9 +110,7 @@ def main():
 
     for index in range(args.start, args.end + 1):
         name = f"test{index:04d}"
-        image_path = args.input_dir / f"{name}.png"
-        if not image_path.is_file():
-            raise FileNotFoundError(f"Input image not found: {image_path}")
+        image_path = find_input_image(args.input_dir, name)
         prompt = prompts.get(name)
         if not prompt:
             raise KeyError(f"Prompt not found for {name} in {args.prompts}")
