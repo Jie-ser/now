@@ -1,0 +1,43 @@
+# GeoReward: DA3 Geometry Reward + Best-of-N for Wan2.2 I2V
+# Python >= 3.10 recommended
+
+# ============ Core Dependencies ============
+torch>=2.4.0
+torchvision>=0.19.0
+numpy>=1.23.5,<2
+pillow
+tqdm
+
+# ============ Wan2.2 I2V ============
+torchaudio
+opencv-python>=4.9.0.80
+diffusers>=0.31.0
+transformers>=4.49.0,<=4.51.3
+tokenizers>=0.20.3
+accelerate>=1.1.1
+imageio[ffmpeg]
+imageio-ffmpeg
+easydict
+ftfy
+flash_attn
+
+# ============ Depth Anything 3 ============
+einops
+huggingface_hub
+xformers
+omegaconf
+safetensors
+trimesh
+open3d
+e3nn
+plyfile
+addict
+
+# ============ Local Packages (install manually) ============
+# Run the following after pip install -r requirements.txt:
+#
+#   pip install -e Depth-Anything-3-main/
+#   pip install -e Wan2.2/  (if setup.py/pyproject.toml exists, otherwise just add to PYTHONPATH)
+#
+# Or set PYTHONPATH:
+#   export PYTHONPATH=$PYTHONPATH:$(pwd)/Wan2.2:$(pwd)/Depth-Anything-3-main/src
