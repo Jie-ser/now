@@ -34,6 +34,11 @@ def parse_args():
     parser.add_argument("--da3_model", required=True)
     parser.add_argument("--input_dir", type=Path, default=ROOT / "inputs")
     parser.add_argument("--prompts", type=Path, default=ROOT / "batch_prompts.json")
+    parser.add_argument(
+        "--name_prefix",
+        default="test",
+        help="Input filename and prompt-key prefix, e.g. 'test' or 'test_real'.",
+    )
     parser.add_argument("--output_dir", type=Path, default=ROOT / "outputs" / "geo_reward_bon")
     parser.add_argument("--N", type=int, default=8)
     parser.add_argument("--size", default="480*832", choices=MAX_AREA_CONFIGS.keys())
@@ -109,7 +114,7 @@ def main():
     bon = GeoRewardBoN(wan_i2v=wan_i2v, da3_reward=da3_reward, max_frames=20)
 
     for index in range(args.start, args.end + 1):
-        name = f"test{index:04d}"
+        name = f"{args.name_prefix}{index:04d}"
         image_path = find_input_image(args.input_dir, name)
         prompt = prompts.get(name)
         if not prompt:
