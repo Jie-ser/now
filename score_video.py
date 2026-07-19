@@ -66,7 +66,10 @@ def load_video_as_frames(video_path):
 
     if ext in (".mp4", ".avi", ".mov", ".mkv"):
         import imageio.v3 as iio
-        frames_np = iio.imread(video_path, plugin="pyav")
+        try:
+            frames_np = iio.imread(video_path, plugin="pyav")
+        except ImportError:
+            frames_np = iio.imread(video_path, plugin="FFMPEG")
         frames = [Image.fromarray(frame) for frame in frames_np]
         return frames
 
