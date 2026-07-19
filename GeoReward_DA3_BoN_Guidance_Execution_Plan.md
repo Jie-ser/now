@@ -63,7 +63,7 @@ def sample_frames(total_frames=81, max_frames=20):
 
 ### 1.5 GeoReward函数：双向深度投射一致性
 
-核心逻辑：帧t的像素通过depth反投影到3D，再通过帧s的相机投影回2D，投影深度应与帧s的实际深度一致。
+核心逻辑：对每对帧(t, s)，同时做正向(t→s)和反向(s→t)投影，各自用70%截断均值排除运动区域的高误差像素，正反向平均。
 
 ```python
 import numpy as np
@@ -94,8 +94,15 @@ class DA3GeoReward:
         total = 0.50 * r_proj + 0.35 * r_anchor + 0.15 * r_conf
         return {"total": total, "proj": r_proj, "anchor": r_anchor, "conf": r_conf}
 
-    def _projection_consistency(self, depths, extrinsics, intrinsics, conf, stride):
-        """双向深度投射一致性"""
+    def _projection_consistency(self, depths, extrinsics, intrinsics, conf, stride,
+                                keep_ratio=0.7):
+        """
+        双向深度投射一致性（正向t→s + 反向s→t，各自截断后平均）
+        
+        keep_ratio: 截断比例，只保留误差最小的这个比例的像素。
+                    目的是隐式排除运动区域（机械臂等）的高误差像素，
+                    与R_anchor的70%策略保持一致。
+        """
         N, H, W = depths.shape
         total_error = 0.0
         count = 0
@@ -109,57 +116,108 @@ class DA3GeoReward:
         for t in range(0, N - stride, stride):
             s = t + stride
 
-            # 帧t: 像素->相机坐标3D点
-            K_t_inv = np.linalg.inv(intrinsics[t])  # (3, 3)
-            rays_t = K_t_inv @ pixels_flat  # (3, H*W)
-            depth_t_flat = depths[t].reshape(-1)  # (H*W,)
-            pts_cam_t = rays_t * depth_t_flat[None, :]  # (3, H*W)
+            # === 正向 t → s ===
+            err_forward = self._project_and_compare(
+                depths[t], depths[s],
+                extrinsics[t], extrinsics[s],
+                intrinsics[t], intrinsics[s],
+                conf[s], pixels_flat, H, W, keep_ratio
+            )
 
-            # 相机坐标->世界坐标
-            # extrinsics是world-to-camera: P_cam = R @ P_world + t
-            # 所以 P_world = R^T @ (P_cam - t)
-            R_t = extrinsics[t, :3, :3]
-            t_t = extrinsics[t, :3, 3]
-            pts_world = R_t.T @ (pts_cam_t - t_t[:, None])  # (3, H*W)
+            # === 反向 s → t ===
+            err_backward = self._project_and_compare(
+                depths[s], depths[t],
+                extrinsics[s], extrinsics[t],
+                intrinsics[s], intrinsics[t],
+                conf[t], pixels_flat, H, W, keep_ratio
+            )
 
-            # 世界坐标->帧s相机坐标
-            R_s = extrinsics[s, :3, :3]
-            t_s = extrinsics[s, :3, 3]
-            pts_cam_s = R_s @ pts_world + t_s[:, None]  # (3, H*W)
-
-            # 投影到帧s像素坐标
-            proj_s = intrinsics[s] @ pts_cam_s  # (3, H*W)
-            px = proj_s[0] / (proj_s[2] + 1e-8)
-            py = proj_s[1] / (proj_s[2] + 1e-8)
-            depth_projected = pts_cam_s[2]  # (H*W,) 投影深度
-
-            # 在帧s深度图上双线性采样
-            depth_s_sampled = self._bilinear_sample(depths[s], px, py)
-            conf_s_sampled = self._bilinear_sample(conf[s], px, py)
-
-            # 有效像素
-            valid = (px >= 0) & (px < W - 1) & (py >= 0) & (py < H - 1) \
-                    & (depth_projected > 1e-3) & (depth_s_sampled > 1e-3) \
-                    & (conf_s_sampled > 0.3)
-
-            if valid.sum() < 100:
-                continue
-
-            # 尺度对齐（中位数法）
-            ratio = depth_projected[valid] / depth_s_sampled[valid]
-            scale = np.median(ratio)
-            aligned = depth_projected[valid] / scale
-
-            # log-ratio误差
-            log_err = np.abs(np.log(aligned / depth_s_sampled[valid] + 1e-8))
-            weighted_err = (log_err * conf_s_sampled[valid]).sum() / (conf_s_sampled[valid].sum() + 1e-8)
-
-            total_error += weighted_err
-            count += 1
+            # 正反向平均
+            if err_forward is not None and err_backward is not None:
+                total_error += (err_forward + err_backward) / 2
+                count += 1
+            elif err_forward is not None:
+                total_error += err_forward
+                count += 1
+            elif err_backward is not None:
+                total_error += err_backward
+                count += 1
 
         if count == 0:
             return 0.0
         return -total_error / count  # 越大越好（误差越小）
+
+    def _project_and_compare(self, depth_src, depth_tgt, ext_src, ext_tgt,
+                              intr_src, intr_tgt, conf_tgt, pixels_flat, H, W,
+                              keep_ratio=0.7):
+        """
+        单方向投影比较：从src帧投影到tgt帧，比较深度一致性。
+        正向(t→s)和反向(s→t)都调用此函数，仅交换参数顺序。
+
+        depth_src: 源帧深度 (H, W)
+        depth_tgt: 目标帧深度 (H, W)
+        ext_src/tgt: 源/目标帧extrinsics (4, 4), world-to-camera
+        intr_src/tgt: 源/目标帧intrinsics (3, 3)
+        conf_tgt: 目标帧置信度 (H, W)
+        pixels_flat: 像素齐次坐标 (3, H*W)
+        keep_ratio: 截断比例，排除误差最大的(1-keep_ratio)像素
+
+        返回: 截断均值误差（标量），或None（有效像素不足）
+        """
+        # 源帧像素 → 源帧相机坐标3D点
+        K_src_inv = np.linalg.inv(intr_src)  # (3, 3)
+        rays = K_src_inv @ pixels_flat  # (3, H*W)
+        pts_cam_src = rays * depth_src.reshape(-1)[None, :]  # (3, H*W)
+
+        # 源帧相机坐标 → 世界坐标
+        # extrinsics是world-to-camera: P_cam = R @ P_world + t
+        # 所以 P_world = R^T @ (P_cam - t)
+        R_src = ext_src[:3, :3]
+        t_src = ext_src[:3, 3]
+        pts_world = R_src.T @ (pts_cam_src - t_src[:, None])  # (3, H*W)
+
+        # 世界坐标 → 目标帧相机坐标
+        R_tgt = ext_tgt[:3, :3]
+        t_tgt = ext_tgt[:3, 3]
+        pts_cam_tgt = R_tgt @ pts_world + t_tgt[:, None]  # (3, H*W)
+
+        # 投影到目标帧像素坐标
+        proj = intr_tgt @ pts_cam_tgt  # (3, H*W)
+        px = proj[0] / (proj[2] + 1e-8)
+        py = proj[1] / (proj[2] + 1e-8)
+        depth_projected = pts_cam_tgt[2]  # (H*W,) 从源帧投影过来的预测深度
+
+        # 在目标帧深度图上双线性采样
+        depth_sampled = self._bilinear_sample(depth_tgt, px, py)
+        conf_sampled = self._bilinear_sample(conf_tgt, px, py)
+
+        # 有效像素：在图像范围内 + 深度>0 + 高置信度
+        valid = (px >= 0) & (px < W - 1) & (py >= 0) & (py < H - 1) \
+                & (depth_projected > 1e-3) & (depth_sampled > 1e-3) \
+                & (conf_sampled > 0.3)
+
+        if valid.sum() < 100:
+            return None
+
+        # 尺度对齐（中位数法）
+        ratio = depth_projected[valid] / depth_sampled[valid]
+        scale = np.median(ratio)
+        if scale < 1e-6:
+            return None
+        aligned = depth_projected[valid] / scale
+
+        # log-ratio误差
+        log_err = np.abs(np.log(aligned / (depth_sampled[valid] + 1e-8) + 1e-8))
+
+        # 截断均值：排除误差最大的(1-keep_ratio)像素
+        # 运动区域（机械臂等）的投影误差大，自然被排到尾部截掉
+        sorted_err = np.sort(log_err)
+        n_keep = int(len(sorted_err) * keep_ratio)
+        if n_keep < 10:
+            return None
+        truncated_err = sorted_err[:n_keep].mean()
+
+        return truncated_err
 
     def _anchor_consistency(self, depths, extrinsics, intrinsics, conf):
         """首帧锚定一致性：静态区域的3D结构应与首帧一致"""
@@ -305,6 +363,7 @@ class GeoRewardBoN:
 - 仅R_proj / 仅R_anchor / 仅R_conf / 全部
 - 不同stride: 2, 4, 8
 - 不同抽帧数: 10, 20, 40
+- keep_ratio: 0.5, 0.6, 0.7, 0.8, 0.9（标定截断比例）
 
 **实验4：DA3模型规模**
 
@@ -399,7 +458,7 @@ class DA3Differentiable:
 
 ### 2.4 可微的投射一致性Reward
 
-Part 1的Reward用numpy不可微。Part 2需要PyTorch全程可微版本：
+Part 1的Reward用numpy不可微。Part 2需要PyTorch全程可微版本，同样包含双向投影和截断均值：
 
 ```python
 class DA3GeoRewardDifferentiable:
@@ -409,13 +468,14 @@ class DA3GeoRewardDifferentiable:
         self.da3 = DA3Differentiable(device=device)
         self.device = device
 
-    def compute_reward(self, frames_01, stride=4):
+    def compute_reward(self, frames_01, stride=4, keep_ratio=0.7):
         """
-        可微的Reward计算
+        可微的Reward计算（双向投影 + 截断均值）
         
         frames_01: (T, 3, H, W) tensor in [0, 1], 来自VAE decode
                    需要requires_grad=True（通过计算图连接到latent）
         stride: 帧间隔
+        keep_ratio: 截断比例，与Part 1一致
         返回: 标量reward tensor（有grad_fn）
         """
         depth, extrinsics, intrinsics, conf = self.da3.forward(frames_01)
@@ -439,61 +499,107 @@ class DA3GeoRewardDifferentiable:
         for t_idx in range(0, T - stride, stride):
             s_idx = t_idx + stride
 
-            # 帧t: 像素->3D
-            K_t_inv = torch.inverse(intrinsics[t_idx, :3, :3])
-            rays = K_t_inv @ pixels_flat  # (3, H*W)
-            pts_cam_t = rays * depth[t_idx].reshape(1, -1)  # (3, H*W)
+            # === 正向 t → s ===
+            err_forward = self._project_and_compare_diff(
+                depth[t_idx], depth[s_idx],
+                extrinsics[t_idx], extrinsics[s_idx],
+                intrinsics[t_idx], intrinsics[s_idx],
+                pixels_flat, H, W, keep_ratio
+            )
 
-            # 相机坐标->世界->帧s相机坐标
-            R_t = extrinsics[t_idx, :3, :3]
-            t_t = extrinsics[t_idx, :3, 3]
-            R_s = extrinsics[s_idx, :3, :3]
-            t_s = extrinsics[s_idx, :3, 3]
+            # === 反向 s → t ===
+            err_backward = self._project_and_compare_diff(
+                depth[s_idx], depth[t_idx],
+                extrinsics[s_idx], extrinsics[t_idx],
+                intrinsics[s_idx], intrinsics[t_idx],
+                pixels_flat, H, W, keep_ratio
+            )
 
-            pts_world = R_t.T @ (pts_cam_t - t_t.unsqueeze(1))
-            pts_cam_s = R_s @ pts_world + t_s.unsqueeze(1)
-
-            # 投影到帧s
-            proj_s = intrinsics[s_idx, :3, :3] @ pts_cam_s
-            px = proj_s[0] / (proj_s[2] + 1e-6)
-            py = proj_s[1] / (proj_s[2] + 1e-6)
-            depth_projected = pts_cam_s[2]
-
-            # 可微的grid_sample
-            grid_x = (px / W) * 2 - 1
-            grid_y = (py / H) * 2 - 1
-            grid = torch.stack([grid_x, grid_y], dim=-1).reshape(1, 1, -1, 2)
-
-            depth_sampled = torch.nn.functional.grid_sample(
-                depth[s_idx].unsqueeze(0).unsqueeze(0),
-                grid, mode='bilinear', align_corners=True, padding_mode='zeros'
-            ).squeeze()  # (H*W,)
-
-            # 有效区域mask（不可微的选择，但不影响梯度流）
-            with torch.no_grad():
-                valid = (px >= 0) & (px < W) & (py >= 0) & (py < H) \
-                        & (depth_projected > 1e-3) & (depth_sampled > 1e-3)
-
-            if valid.sum() < 100:
-                continue
-
-            # 尺度对齐（detach中位数，避免梯度穿过排序）
-            with torch.no_grad():
-                ratio_detached = depth_projected[valid] / depth_sampled[valid]
-                scale = ratio_detached.median()
-
-            aligned = depth_projected[valid] / scale
-            # L1 误差（可微）
-            error = (aligned - depth_sampled[valid]).abs().mean()
-
-            total_error = total_error + error
-            count += 1
+            # 正反向平均
+            if err_forward is not None and err_backward is not None:
+                total_error = total_error + (err_forward + err_backward) / 2
+                count += 1
+            elif err_forward is not None:
+                total_error = total_error + err_forward
+                count += 1
+            elif err_backward is not None:
+                total_error = total_error + err_backward
+                count += 1
 
         if count == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        # 返回负误差作为reward（越大越好）
         return -(total_error / count)
+
+    def _project_and_compare_diff(self, depth_src, depth_tgt, ext_src, ext_tgt,
+                                   intr_src, intr_tgt, pixels_flat, H, W,
+                                   keep_ratio=0.7):
+        """
+        可微的单方向投影比较。正向和反向都调用此函数。
+        
+        返回: 截断均值误差 tensor（有grad_fn），或None
+        """
+        # 源帧像素 → 3D
+        K_src_inv = torch.inverse(intr_src[:3, :3])
+        rays = K_src_inv @ pixels_flat
+        pts_cam_src = rays * depth_src.reshape(1, -1)
+
+        # 源帧相机 → 世界 → 目标帧相机
+        R_src = ext_src[:3, :3]
+        t_src_vec = ext_src[:3, 3]
+        R_tgt = ext_tgt[:3, :3]
+        t_tgt_vec = ext_tgt[:3, 3]
+
+        pts_world = R_src.T @ (pts_cam_src - t_src_vec.unsqueeze(1))
+        pts_cam_tgt = R_tgt @ pts_world + t_tgt_vec.unsqueeze(1)
+
+        # 投影到目标帧
+        proj = intr_tgt[:3, :3] @ pts_cam_tgt
+        px = proj[0] / (proj[2] + 1e-6)
+        py = proj[1] / (proj[2] + 1e-6)
+        depth_projected = pts_cam_tgt[2]
+
+        # 可微的grid_sample
+        grid_x = (px / W) * 2 - 1
+        grid_y = (py / H) * 2 - 1
+        grid = torch.stack([grid_x, grid_y], dim=-1).reshape(1, 1, -1, 2)
+
+        depth_sampled = torch.nn.functional.grid_sample(
+            depth_tgt.unsqueeze(0).unsqueeze(0),
+            grid, mode='bilinear', align_corners=True, padding_mode='zeros'
+        ).squeeze()
+
+        # 有效区域mask（不可微的选择，但不影响梯度流）
+        with torch.no_grad():
+            valid = (px >= 0) & (px < W) & (py >= 0) & (py < H) \
+                    & (depth_projected > 1e-3) & (depth_sampled > 1e-3)
+
+        if valid.sum() < 100:
+            return None
+
+        # 尺度对齐（detach中位数，避免梯度穿过排序）
+        with torch.no_grad():
+            ratio_detached = depth_projected[valid] / depth_sampled[valid]
+            scale = ratio_detached.median()
+
+        aligned = depth_projected[valid] / scale
+
+        # L1误差
+        errors = (aligned - depth_sampled[valid]).abs()
+
+        # 截断均值：对误差排序，只保留最小的keep_ratio部分
+        # 注意：sort不可微，但我们用detach的排序索引来选择可微的error值
+        with torch.no_grad():
+            _, sorted_indices = errors.sort()
+            n_keep = int(len(sorted_indices) * keep_ratio)
+            if n_keep < 10:
+                return None
+            keep_indices = sorted_indices[:n_keep]
+
+        # 用不可微的索引选择可微的误差值，梯度仍可流经被选中的error
+        truncated_error = errors[keep_indices].mean()
+
+        return truncated_error
 ```
 
 ### 2.5 Wan2.2 Tweedie估计
@@ -690,6 +796,7 @@ class GeoGuidedBoN:
 | num_guidance_frames | 4 - 12 | 8帧；越多越准但显存越大 |
 | DA3 process_res | 336 - 504 | 引导时可用336（快），BoN评分用504（准） |
 | BoN N（组合时） | 4 - 8 | 有引导时不需要大N |
+| keep_ratio | 0.5 - 0.9 | 0.7是起点；运动占比大时可调高 |
 
 **调优流程**：
 1. 先固定w_s=0.005，跑几个样本看有无明显效果

@@ -26,13 +26,14 @@ class DA3GeoReward:
         self.device = device
         self.process_res = process_res
 
-    def compute_reward(self, frames_pil, stride=4):
+    def compute_reward(self, frames_pil, stride=4, keep_ratio=0.7):
         """
         Compute geometry reward for a sequence of frames.
 
         Args:
             frames_pil: List of PIL Images (sampled keyframes, ~20 frames).
             stride: Frame interval for projection consistency check.
+            keep_ratio: Fraction of pixels to keep after sorting by error.
 
         Returns:
             Dict with keys: "total", "proj", "anchor", "conf"
@@ -47,21 +48,26 @@ class DA3GeoReward:
         if extrinsics is None or intrinsics is None:
             return {"total": 0.0, "proj": 0.0, "anchor": 0.0, "conf": float(conf.mean()) if conf is not None else 0.0}
 
-        r_proj = self._projection_consistency(depths, extrinsics, intrinsics, conf, stride)
+        r_proj = self._projection_consistency(depths, extrinsics, intrinsics, conf, stride, keep_ratio)
         r_anchor = self._anchor_consistency(depths, extrinsics, intrinsics, conf)
         r_conf = self._confidence_score(conf)
 
         total = 0.50 * r_proj + 0.35 * r_anchor + 0.15 * r_conf
         return {"total": total, "proj": r_proj, "anchor": r_anchor, "conf": r_conf}
 
-    def _projection_consistency(self, depths, extrinsics, intrinsics, conf, stride):
+    def _projection_consistency(self, depths, extrinsics, intrinsics, conf, stride,
+                                keep_ratio=0.7):
         """
         Bi-directional depth projection consistency.
 
         For frame pairs (t, s=t+stride):
-          1. Unproject frame t pixels to 3D world coordinates
-          2. Project those 3D points into frame s
-          3. Compare projected depth with frame s's actual depth
+          1. Forward (t->s): unproject t to 3D, project into s, compare depth
+          2. Backward (s->t): unproject s to 3D, project into t, compare depth
+          3. Average the truncated mean errors from both directions
+
+        keep_ratio: fraction of pixels to keep after sorting by error (ascending).
+                    Implicitly excludes moving regions (robot arm) whose projection
+                    errors are large.
         """
         N, H, W = depths.shape
         total_error = 0.0
@@ -73,60 +79,95 @@ class DA3GeoReward:
         for t in range(0, N - stride, stride):
             s = t + stride
 
-            # Frame t: pixel -> camera 3D
-            K_t_inv = np.linalg.inv(intrinsics[t])  # (3, 3)
-            rays_t = K_t_inv @ pixels_flat  # (3, H*W)
-            depth_t_flat = depths[t].reshape(-1)
-            pts_cam_t = rays_t * depth_t_flat[None, :]  # (3, H*W)
-
-            # Camera -> world: extrinsics is [R|t] (3x4), P_cam = R @ P_world + t
-            R_t = extrinsics[t, :3, :3]
-            t_t = extrinsics[t, :3, 3]
-            pts_world = R_t.T @ (pts_cam_t - t_t[:, None])  # (3, H*W)
-
-            # World -> frame s camera
-            R_s = extrinsics[s, :3, :3]
-            t_s = extrinsics[s, :3, 3]
-            pts_cam_s = R_s @ pts_world + t_s[:, None]  # (3, H*W)
-
-            # Project to frame s pixel coordinates
-            proj_s = intrinsics[s] @ pts_cam_s  # (3, H*W)
-            px = proj_s[0] / (proj_s[2] + 1e-8)
-            py = proj_s[1] / (proj_s[2] + 1e-8)
-            depth_projected = pts_cam_s[2]  # projected depth
-
-            # Bilinear sample from frame s depth/conf maps
-            depth_s_sampled = self._bilinear_sample(depths[s], px, py)
-            conf_weight = self._bilinear_sample(conf[s], px, py) if conf is not None else np.ones_like(px)
-
-            # Valid pixel mask
-            valid = (
-                (px >= 0) & (px < W - 1) & (py >= 0) & (py < H - 1)
-                & (depth_projected > 1e-3) & (depth_s_sampled > 1e-3)
-                & (conf_weight > 0.3)
+            err_forward = self._project_and_compare(
+                depths[t], depths[s],
+                extrinsics[t], extrinsics[s],
+                intrinsics[t], intrinsics[s],
+                conf[s], pixels_flat, H, W, keep_ratio
             )
 
-            if valid.sum() < 100:
-                continue
+            err_backward = self._project_and_compare(
+                depths[s], depths[t],
+                extrinsics[s], extrinsics[t],
+                intrinsics[s], intrinsics[t],
+                conf[t], pixels_flat, H, W, keep_ratio
+            )
 
-            # Scale alignment (median ratio)
-            ratio = depth_projected[valid] / depth_s_sampled[valid]
-            scale = np.median(ratio)
-            if scale < 1e-6:
-                continue
-            aligned = depth_projected[valid] / scale
-
-            # Log-ratio error weighted by confidence
-            log_err = np.abs(np.log(aligned / (depth_s_sampled[valid] + 1e-8) + 1e-8))
-            w = conf_weight[valid]
-            weighted_err = (log_err * w).sum() / (w.sum() + 1e-8)
-
-            total_error += weighted_err
-            count += 1
+            if err_forward is not None and err_backward is not None:
+                total_error += (err_forward + err_backward) / 2
+                count += 1
+            elif err_forward is not None:
+                total_error += err_forward
+                count += 1
+            elif err_backward is not None:
+                total_error += err_backward
+                count += 1
 
         if count == 0:
             return 0.0
         return -total_error / count
+
+    def _project_and_compare(self, depth_src, depth_tgt, ext_src, ext_tgt,
+                             intr_src, intr_tgt, conf_tgt, pixels_flat, H, W,
+                             keep_ratio=0.7):
+        """
+        Single-direction projection comparison: unproject src pixels to 3D,
+        project into tgt frame, compare projected depth with tgt actual depth.
+
+        Returns truncated mean error (scalar), or None if insufficient valid pixels.
+        """
+        K_src_inv = np.linalg.inv(intr_src)  # (3, 3)
+        rays = K_src_inv @ pixels_flat  # (3, H*W)
+        pts_cam_src = rays * depth_src.reshape(-1)[None, :]  # (3, H*W)
+
+        # Camera -> world: extrinsics is [R|t] (3x4), P_cam = R @ P_world + t
+        R_src = ext_src[:3, :3]
+        t_src = ext_src[:3, 3]
+        pts_world = R_src.T @ (pts_cam_src - t_src[:, None])  # (3, H*W)
+
+        # World -> target camera
+        R_tgt = ext_tgt[:3, :3]
+        t_tgt = ext_tgt[:3, 3]
+        pts_cam_tgt = R_tgt @ pts_world + t_tgt[:, None]  # (3, H*W)
+
+        # Project to target pixel coordinates
+        proj = intr_tgt @ pts_cam_tgt  # (3, H*W)
+        px = proj[0] / (proj[2] + 1e-8)
+        py = proj[1] / (proj[2] + 1e-8)
+        depth_projected = pts_cam_tgt[2]
+
+        # Bilinear sample from target depth/conf maps
+        depth_sampled = self._bilinear_sample(depth_tgt, px, py)
+        conf_sampled = self._bilinear_sample(conf_tgt, px, py) if conf_tgt is not None else np.ones_like(px)
+
+        # Valid pixel mask
+        valid = (
+            (px >= 0) & (px < W - 1) & (py >= 0) & (py < H - 1)
+            & (depth_projected > 1e-3) & (depth_sampled > 1e-3)
+            & (conf_sampled > 0.3)
+        )
+
+        if valid.sum() < 100:
+            return None
+
+        # Scale alignment (median ratio)
+        ratio = depth_projected[valid] / depth_sampled[valid]
+        scale = np.median(ratio)
+        if scale < 1e-6:
+            return None
+        aligned = depth_projected[valid] / scale
+
+        # Log-ratio error
+        log_err = np.abs(np.log(aligned / (depth_sampled[valid] + 1e-8) + 1e-8))
+
+        # Truncated mean: keep only the lowest-error fraction of pixels
+        sorted_err = np.sort(log_err)
+        n_keep = int(len(sorted_err) * keep_ratio)
+        if n_keep < 10:
+            return None
+        truncated_err = sorted_err[:n_keep].mean()
+
+        return truncated_err
 
     def _anchor_consistency(self, depths, extrinsics, intrinsics, conf):
         """

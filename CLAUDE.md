@@ -7,10 +7,14 @@
 ```
 now/
 ├── geo_reward/              # 核心模块：GeoReward计算 + BoN流程
-│   ├── da3_reward.py        # DA3GeoReward（投射一致性+锚定+置信度）
+│   ├── da3_reward.py        # DA3GeoReward（双向投射一致性+锚定+置信度）
 │   ├── bon_pipeline.py      # GeoRewardBoN / GeoRewardBoNOffline
 │   └── utils.py             # 格式转换、抽帧
 ├── run_bon.py               # CLI入口（--mode bon / score）
+├── run_bon_batch.py         # 批量BoN运行（--start/--end，模型只加载一次）
+├── score_video.py           # 独立视频评分CLI（支持.mp4/.pt，输出_cal_result.json）
+├── batch_prompts.json       # 50条机械臂测试prompt（test0001-test0050）
+├── GeoReward_DA3_BoN_Guidance_Execution_Plan.md  # 完整执行方案（Part 1 + Part 2）
 ├── Wan2.2/                  # 阿里视频生成模型（14B DiT, Flow Matching）
 ├── Depth-Anything-3-main/   # ByteDance深度估计模型（DA3）
 ├── WMReward-main/           # Meta参考实现（VJEPA-2 reward）
@@ -31,12 +35,23 @@ pip install -r requirements.txt
 pip install -e Depth-Anything-3-main/
 export PYTHONPATH=$PYTHONPATH:$(pwd)/Wan2.2
 
-# Best-of-N
+# Best-of-N（单条）
 python run_bon.py \
   --ckpt_dir /path/to/Wan2.2-I2V-A14B \
   --image /path/to/first_frame.png \
   --prompt "动作指令" \
   --N 8 --size 480*832 --sample_shift 3.0 --t5_cpu
+
+# Best-of-N（批量）
+python run_bon_batch.py \
+  --start 1 --end 10 \
+  --ckpt_dir /path/to/Wan2.2-I2V-A14B \
+  --da3_model /path/to/DA3 \
+  --t5_cpu
+
+# 独立视频评分
+python score_video.py --video path/to/video.mp4
+python score_video.py --video path/to/video.pt --output_dir results/ --keep_ratio 0.8
 ```
 
 ## 关键技术细节
@@ -48,6 +63,8 @@ python run_bon.py \
 - Wan2.2 使用双DiT（high_noise_model + low_noise_model），boundary=0.9
 - Flow Matching Tweedie估计：`x0 = x_t - sigma_t * velocity`
 - Reward三分量：投射一致性50% + 首帧锚定35% + DA3置信度15%
+- 投射一致性：双向投射（t→s + s→t）+ 截断均值（keep_ratio=0.7，排除运动区域）
+- 首帧锚定：同样用70%截断，只保留偏差最小的像素（假定为静态区域）
 
 ## 开发计划
 
