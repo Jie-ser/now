@@ -86,6 +86,13 @@ def find_input_image(input_dir, name):
         candidate = input_dir / f"{name}{suffix}"
         if candidate.is_file():
             return candidate
+    # Some datasets retain a duplicate-name suffix such as test_real0073(1).jpg.
+    matches = sorted(
+        path for path in input_dir.glob(f"{name}*")
+        if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+    )
+    if matches:
+        return matches[0]
     raise FileNotFoundError(
         f"Input image not found for {name}; expected one of "
         f"{input_dir / (name + '.png')}, {input_dir / (name + '.jpg')}, "
