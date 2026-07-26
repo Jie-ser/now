@@ -429,3 +429,287 @@ class WanI2V:
             dist.barrier()
 
         return videos[0] if self.rank == 0 else None
+
+    # ------------------------------------------------------------------ #
+    #  Progressive Elimination helpers                                    #
+    # ------------------------------------------------------------------ #
+
+    def prepare_progressive(
+        self,
+        input_prompt,
+        img,
+        seeds,
+        max_area=720 * 1280,
+        frame_num=81,
+        shift=5.0,
+        sample_solver='unipc',
+        sampling_steps=40,
+        guide_scale=5.0,
+        n_prompt="",
+        offload_model=True,
+    ):
+        """
+        Prepare shared conditioning and per-candidate initial states.
+
+        Returns a dict with everything needed by ``denoise_step_batch``
+        and ``decode_candidates``.
+        """
+        guide_scale = (guide_scale, guide_scale) if isinstance(
+            guide_scale, float) else guide_scale
+        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+
+        F = frame_num
+        h, w = img.shape[1:]
+        aspect_ratio = h / w
+        lat_h = round(
+            np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
+            self.patch_size[1] * self.patch_size[1])
+        lat_w = round(
+            np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] //
+            self.patch_size[2] * self.patch_size[2])
+        h = lat_h * self.vae_stride[1]
+        w = lat_w * self.vae_stride[2]
+
+        max_seq_len = ((F - 1) // self.vae_stride[0] + 1) * lat_h * lat_w // (
+            self.patch_size[1] * self.patch_size[2])
+        max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
+
+        if n_prompt == "":
+            n_prompt = self.sample_neg_prompt
+
+        if not self.t5_cpu:
+            self.text_encoder.model.to(self.device)
+            context = self.text_encoder([input_prompt], self.device)
+            context_null = self.text_encoder([n_prompt], self.device)
+            if offload_model:
+                self.text_encoder.model.cpu()
+        else:
+            context = self.text_encoder([input_prompt], torch.device('cpu'))
+            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+            context = [t.to(self.device) for t in context]
+            context_null = [t.to(self.device) for t in context_null]
+
+        y = self.vae.encode([
+            torch.concat([
+                torch.nn.functional.interpolate(
+                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
+                        0, 1),
+                torch.zeros(3, F - 1, h, w)
+            ], dim=1).to(self.device)
+        ])[0]
+        msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
+        msk[:, 1:] = 0
+        msk = torch.concat([
+            torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
+        ], dim=1)
+        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+        msk = msk.transpose(1, 2)[0]
+        y = torch.concat([msk, y])
+
+        candidates = []
+        for seed in seeds:
+            seed_g = torch.Generator(device=self.device)
+            seed_g.manual_seed(seed)
+            noise = torch.randn(
+                16,
+                (F - 1) // self.vae_stride[0] + 1,
+                lat_h,
+                lat_w,
+                dtype=torch.float32,
+                generator=seed_g,
+                device=self.device)
+
+            if sample_solver == 'unipc':
+                scheduler = FlowUniPCMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False)
+                scheduler.set_timesteps(
+                    sampling_steps, device=self.device, shift=shift)
+            elif sample_solver == 'dpm++':
+                scheduler = FlowDPMSolverMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False)
+                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                retrieve_timesteps(
+                    scheduler, device=self.device, sigmas=sampling_sigmas)
+            else:
+                raise NotImplementedError("Unsupported solver.")
+
+            candidates.append({
+                'latent': noise,
+                'scheduler': scheduler,
+                'generator': seed_g,
+                'seed': seed,
+                'step_index': 0,
+            })
+
+        timesteps = candidates[0]['scheduler'].timesteps
+
+        return {
+            'candidates': candidates,
+            'timesteps': timesteps,
+            'context': context,
+            'context_null': context_null,
+            'y': y,
+            'max_seq_len': max_seq_len,
+            'guide_scale': guide_scale,
+            'offload_model': offload_model,
+            'frame_num': F,
+        }
+
+    def denoise_candidates(self, state, alive_indices, start_step, end_step):
+        """
+        Run denoising steps [start_step, end_step) for alive candidates.
+
+        Operates in-place on ``state['candidates']``.  Returns the last
+        ``noise_pred`` for each alive candidate (needed to compute pred_x0).
+        """
+        offload_model = state['offload_model']
+        guide_scale = state['guide_scale']
+        timesteps = state['timesteps']
+        boundary = self.boundary * self.num_train_timesteps
+
+        arg_c = {
+            'context': [state['context'][0]],
+            'seq_len': state['max_seq_len'],
+            'y': [state['y']],
+        }
+        arg_null = {
+            'context': state['context_null'],
+            'seq_len': state['max_seq_len'],
+            'y': [state['y']],
+        }
+
+        last_noise_preds = {}
+        last_pre_step_latents = {}
+
+        with (
+            torch.amp.autocast('cuda', dtype=self.param_dtype),
+            torch.no_grad(),
+        ):
+            if offload_model:
+                torch.cuda.empty_cache()
+
+            for step_idx in range(start_step, end_step):
+                t = timesteps[step_idx]
+                is_phase_last_step = (step_idx == end_step - 1)
+
+                model = self._prepare_model_for_timestep(
+                    t, boundary, offload_model)
+                sample_guide_scale = guide_scale[1] if t.item() >= boundary else guide_scale[0]
+
+                for cand_idx in alive_indices:
+                    cand = state['candidates'][cand_idx]
+                    latent = cand['latent']
+                    scheduler = cand['scheduler']
+
+                    latent_model_input = [latent.to(self.device)]
+                    timestep = torch.stack([t]).to(self.device)
+
+                    noise_pred_cond = model(
+                        latent_model_input, t=timestep, **arg_c)[0]
+                    noise_pred_uncond = model(
+                        latent_model_input, t=timestep, **arg_null)[0]
+                    noise_pred = noise_pred_uncond + sample_guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
+
+                    # pred_x0 is only extracted at the phase checkpoint.  Do
+                    # not clone a full video latent at every preceding step.
+                    if is_phase_last_step:
+                        last_noise_preds[cand_idx] = noise_pred
+                        last_pre_step_latents[cand_idx] = latent.clone()
+
+                    temp = scheduler.step(
+                        noise_pred.unsqueeze(0),
+                        t,
+                        latent.unsqueeze(0),
+                        return_dict=False,
+                        generator=cand['generator'])[0]
+                    cand['latent'] = temp.squeeze(0)
+
+                    del latent_model_input, timestep
+                    del noise_pred_cond, noise_pred_uncond
+
+                if offload_model:
+                    torch.cuda.empty_cache()
+
+            if offload_model:
+                self.low_noise_model.cpu()
+                self.high_noise_model.cpu()
+                torch.cuda.empty_cache()
+
+        return last_noise_preds, last_pre_step_latents
+
+    def extract_pred_x0(self, state, cand_idx, noise_pred, pre_step_latent):
+        """
+        Compute the clean-latent prediction: x0 = x_t - sigma_t * v_pred.
+
+        Uses the latent BEFORE scheduler.step() was called (pre_step_latent)
+        and the sigma from that same step (step_index - 1, since step()
+        already incremented it).
+        """
+        scheduler = state['candidates'][cand_idx]['scheduler']
+        last_step_idx = scheduler.step_index - 1
+        sigma_t = scheduler.sigmas[last_step_idx]
+        pred_x0 = pre_step_latent - sigma_t * noise_pred
+        return pred_x0
+
+    def get_current_sigma(self, state, cand_idx):
+        """Return the current sigma for a given candidate."""
+        scheduler = state['candidates'][cand_idx]['scheduler']
+        return float(scheduler.sigmas[scheduler.step_index])
+
+    def decode_latent(self, latent):
+        """VAE decode a single latent tensor. Returns (3, T, H, W) in [-1, 1]."""
+        with (
+            torch.amp.autocast('cuda', dtype=self.param_dtype),
+            torch.no_grad(),
+        ):
+            videos = self.vae.decode([latent])
+        return videos[0]
+
+    def find_step_for_sigma(self, state, target_sigma):
+        """
+        Find how many denoising steps must be completed to evaluate at the
+        first scheduler sigma that is <= ``target_sigma``.
+
+        The returned value is an exclusive ``end_step`` suitable for
+        ``range(start_step, end_step)``.  For example, when sigma[i] is the
+        first qualifying value, this returns i + 1 so step i is actually run.
+        Returns None if no scheduler timestep qualifies.
+        """
+        sigmas = state['candidates'][0]['scheduler'].sigmas
+        timesteps = state['timesteps']
+        best_step = None
+        for step_idx in range(len(timesteps)):
+            s = float(sigmas[step_idx])
+            if s <= target_sigma:
+                best_step = step_idx + 1
+                break
+        return best_step
+
+    def cleanup_progressive(self, state, offload_model=True):
+        """Release references held by the progressive state."""
+        if state is None:
+            return
+
+        for cand in state.get('candidates', []):
+            cand.pop('latent', None)
+            cand.pop('scheduler', None)
+            cand.pop('generator', None)
+        state.get('candidates', []).clear()
+
+        # Shared conditioning can also hold CUDA tensors.  Remove the
+        # references explicitly so cleanup remains effective in batch jobs
+        # even when an exception interrupts a checkpoint phase.
+        for key in ('context', 'context_null', 'y', 'timesteps'):
+            state.pop(key, None)
+
+        if offload_model:
+            self.low_noise_model.cpu()
+            self.high_noise_model.cpu()
+            torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.synchronize()

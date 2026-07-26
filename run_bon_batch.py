@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT / "Wan2.2"))
 import wan
 from wan.configs import MAX_AREA_CONFIGS, WAN_CONFIGS
 from wan.utils.utils import save_video
-from geo_reward import DA3GeoReward, GeoRewardBoN
+from geo_reward import DA3GeoReward, GeoRewardBoN, GeoRewardBoNProgressive, GeometryRewardConfig
 
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Batch runner for GeoReward BoN")
+    parser = argparse.ArgumentParser(description="Batch runner for GeoReward V1 BoN")
     parser.add_argument("--start", type=int, required=True, help="First test index, inclusive")
     parser.add_argument("--end", type=int, required=True, help="Last test index, inclusive")
     parser.add_argument("--ckpt_dir", required=True)
@@ -44,6 +44,26 @@ def parse_args():
     parser.add_argument("--size", default="480*832", choices=MAX_AREA_CONFIGS.keys())
     parser.add_argument("--sample_shift", type=float, default=3.0)
     parser.add_argument("--t5_cpu", action="store_true")
+
+    # V1 reward config
+    parser.add_argument("--image_diff_threshold", type=float, default=15.0)
+    parser.add_argument("--image_vote_ratio", type=float, default=0.30)
+    parser.add_argument("--depth_change_threshold", type=float, default=0.05)
+    parser.add_argument("--min_motion_threshold", type=float, default=0.01)
+    parser.add_argument("--tau_smooth", type=float, default=2.0)
+    parser.add_argument("--tau_shape", type=float, default=0.10)
+    parser.add_argument("--motion_shape_weight", type=float, default=0.70)
+    parser.add_argument("--motion_smooth_weight", type=float, default=0.30)
+
+    # Progressive elimination args
+    parser.add_argument("--no_progressive", action="store_true",
+                        help="Disable progressive elimination (use original sequential BoN).")
+    parser.add_argument("--sigma_checkpoints", type=float, nargs="+",
+                        default=[0.65, 0.45],
+                        help="σ thresholds for early checkpoints (default: 0.65 0.45).")
+    parser.add_argument("--elimination_std", type=float, default=1.5,
+                        help="Elimination threshold: mean - k*std (default: 1.5).")
+
     return parser.parse_args()
 
 
@@ -74,6 +94,17 @@ def save_case(candidates, rewards, best_idx, image_path, prompt, output_dir, cfg
             {"rank": rank, "original_idx": i, "reward": rewards[i], "is_best": i == best_idx}
             for rank, i in enumerate(ranked_indices, start=1)
         ],
+        "config": {
+            "reward_version": "v1",
+            "image_diff_threshold": args.image_diff_threshold,
+            "image_vote_ratio": args.image_vote_ratio,
+            "depth_change_threshold": args.depth_change_threshold,
+            "min_motion_threshold": args.min_motion_threshold,
+            "tau_smooth": args.tau_smooth,
+            "tau_shape": args.tau_shape,
+            "motion_shape_weight": args.motion_shape_weight,
+            "motion_smooth_weight": args.motion_smooth_weight,
+        },
     }
     with (case_dir / "rewards.json").open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
@@ -86,7 +117,6 @@ def find_input_image(input_dir, name):
         candidate = input_dir / f"{name}{suffix}"
         if candidate.is_file():
             return candidate
-    # Some datasets retain a duplicate-name suffix such as test_real0073(1).jpg.
     matches = sorted(
         path for path in input_dir.glob(f"{name}*")
         if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
@@ -111,14 +141,53 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         raise RuntimeError("CUDA is required for Wan2.2 I2V.")
+
+    reward_cfg = GeometryRewardConfig(
+        image_diff_threshold=args.image_diff_threshold,
+        image_vote_ratio=args.image_vote_ratio,
+        depth_change_threshold=args.depth_change_threshold,
+        min_motion_threshold=args.min_motion_threshold,
+        tau_smooth=args.tau_smooth,
+        tau_shape=args.tau_shape,
+        motion_shape_weight=args.motion_shape_weight,
+        motion_smooth_weight=args.motion_smooth_weight,
+    )
+
     logger.info("Loading DA3 once on %s...", torch.cuda.get_device_name(0))
-    da3_reward = DA3GeoReward(model_name=args.da3_model, device=str(device), process_res=504)
+    da3_reward = DA3GeoReward(
+        model_name=args.da3_model,
+        device=str(device),
+        process_res=504,
+        cfg=reward_cfg,
+    )
+
     logger.info("Loading Wan2.2 I2V once...")
-    cfg = WAN_CONFIGS["i2v-A14B"]
+    wan_cfg = WAN_CONFIGS["i2v-A14B"]
     wan_i2v = wan.WanI2V(
-        config=cfg, checkpoint_dir=args.ckpt_dir, device_id=0, rank=0, t5_cpu=args.t5_cpu
+        config=wan_cfg, checkpoint_dir=args.ckpt_dir, device_id=0, rank=0, t5_cpu=args.t5_cpu
     )
     bon = GeoRewardBoN(wan_i2v=wan_i2v, da3_reward=da3_reward, max_frames=20)
+
+    use_progressive = not args.no_progressive
+
+    if use_progressive:
+        bon_prog = GeoRewardBoNProgressive(
+            wan_i2v=wan_i2v,
+            da3_reward=da3_reward,
+            max_frames=20,
+            sigma_checkpoints=args.sigma_checkpoints,
+            elimination_std=args.elimination_std,
+        )
+
+    def _save_fn(tensor, path):
+        save_video(
+            tensor=tensor[None],
+            save_file=path,
+            fps=wan_cfg.sample_fps,
+            nrow=1,
+            normalize=True,
+            value_range=(-1, 1),
+        )
 
     for index in range(args.start, args.end + 1):
         name = f"{args.name_prefix}{index:04d}"
@@ -128,21 +197,52 @@ def main():
             raise KeyError(f"Prompt not found for {name} in {args.prompts}")
         logger.info("===== %s (%d/%d) =====", name, index, args.end)
         t0 = time.time()
-        candidates, rewards, best_idx = bon.generate(
-            prompt=prompt,
-            image=Image.open(image_path).convert("RGB"),
-            N=args.N,
-            frame_num=81,
-            seed_base=None,
-            reward_stride=2,
-            max_area=MAX_AREA_CONFIGS[args.size],
-            shift=args.sample_shift,
-            sample_solver="unipc",
-            sampling_steps=40,
-            guide_scale=5.0,
-            offload_model=True,
-        )
-        save_case(candidates, rewards, best_idx, image_path, prompt, args.output_dir, cfg, args, time.time() - t0)
+
+        case_dir = args.output_dir / f"{image_path.stem}_{time.strftime('%Y%m%d_%H%M%S')}"
+        case_dir.mkdir(parents=True, exist_ok=True)
+
+        if use_progressive:
+            best_video, result_log, best_seed = bon_prog.generate(
+                prompt=prompt,
+                image=Image.open(image_path).convert("RGB"),
+                N=args.N,
+                frame_num=81,
+                seed_base=None,
+                output_dir=str(case_dir),
+                save_fn=_save_fn,
+                max_area=MAX_AREA_CONFIGS[args.size],
+                shift=args.sample_shift,
+                sample_solver="unipc",
+                sampling_steps=40,
+                guide_scale=5.0,
+                offload_model=True,
+            )
+            elapsed = time.time() - t0
+            if best_video is not None:
+                best_path = str(case_dir / f"seed_{best_seed}_BEST.mp4")
+                _save_fn(best_video, best_path)
+            result_log["prompt"] = prompt
+            result_log["image"] = str(image_path.resolve())
+            result_log["total_time_sec"] = elapsed
+            with (case_dir / "rewards.json").open("w", encoding="utf-8") as f:
+                json.dump(result_log, f, indent=2, ensure_ascii=False)
+            logger.info("Saved results to %s", case_dir)
+        else:
+            candidates, rewards, best_idx = bon.generate(
+                prompt=prompt,
+                image=Image.open(image_path).convert("RGB"),
+                N=args.N,
+                frame_num=81,
+                seed_base=None,
+                max_area=MAX_AREA_CONFIGS[args.size],
+                shift=args.sample_shift,
+                sample_solver="unipc",
+                sampling_steps=40,
+                guide_scale=5.0,
+                offload_model=True,
+            )
+            save_case(candidates, rewards, best_idx, image_path, prompt,
+                      args.output_dir, wan_cfg, args, time.time() - t0)
 
 
 if __name__ == "__main__":

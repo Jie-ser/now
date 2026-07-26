@@ -1,11 +1,11 @@
 """
-Score a single video file using DA3 GeoReward.
+Score a single video file using DA3 GeoReward V1.
 
 Supports .mp4 video files and .pt tensor files (Wan2.2 output format).
 
 Usage:
     python score_video.py --video path/to/video.mp4
-    python score_video.py --video path/to/video.pt --output_dir results/ --keep_ratio 0.8
+    python score_video.py --video path/to/video.pt --output_dir results/
 """
 
 import argparse
@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
-from geo_reward import DA3GeoReward
+from geo_reward import DA3GeoReward, GeometryRewardConfig
 from geo_reward.utils import wan_output_to_da3_input, sample_frames
 
 
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Score a video with DA3 GeoReward")
+    parser = argparse.ArgumentParser(description="Score a video with DA3 GeoReward V1")
 
     parser.add_argument("--video", type=str, required=True,
                         help="Path to video file (.mp4 or .pt)")
@@ -40,10 +40,16 @@ def parse_args():
                         help="DA3 processing resolution.")
     parser.add_argument("--max_frames", type=int, default=20,
                         help="Number of keyframes to sample.")
-    parser.add_argument("--reward_stride", type=int, default=2,
-                        help="Frame stride for projection consistency.")
-    parser.add_argument("--keep_ratio", type=float, default=0.7,
-                        help="Truncated mean keep ratio (0-1).")
+
+    # V1 reward config
+    parser.add_argument("--image_diff_threshold", type=float, default=15.0)
+    parser.add_argument("--image_vote_ratio", type=float, default=0.30)
+    parser.add_argument("--depth_change_threshold", type=float, default=0.05)
+    parser.add_argument("--min_motion_threshold", type=float, default=0.01)
+    parser.add_argument("--tau_smooth", type=float, default=2.0)
+    parser.add_argument("--tau_shape", type=float, default=0.10)
+    parser.add_argument("--motion_shape_weight", type=float, default=0.70)
+    parser.add_argument("--motion_smooth_weight", type=float, default=0.30)
 
     return parser.parse_args()
 
@@ -94,23 +100,32 @@ def main():
     sampled_frames = [all_frames[i] for i in indices if i < len(all_frames)]
     logger.info(f"Sampled {len(sampled_frames)} keyframes for scoring")
 
+    cfg = GeometryRewardConfig(
+        image_diff_threshold=args.image_diff_threshold,
+        image_vote_ratio=args.image_vote_ratio,
+        depth_change_threshold=args.depth_change_threshold,
+        min_motion_threshold=args.min_motion_threshold,
+        tau_smooth=args.tau_smooth,
+        tau_shape=args.tau_shape,
+        motion_shape_weight=args.motion_shape_weight,
+        motion_smooth_weight=args.motion_smooth_weight,
+    )
+
     logger.info(f"Loading DA3 model: {args.da3_model}")
     da3_reward = DA3GeoReward(
         model_name=args.da3_model,
         device=device,
         process_res=args.process_res,
+        cfg=cfg,
     )
 
     logger.info("Computing reward...")
-    reward = da3_reward.compute_reward(
-        sampled_frames,
-        stride=args.reward_stride,
-        keep_ratio=args.keep_ratio,
-    )
+    reward = da3_reward.compute_reward(sampled_frames)
 
     logger.info(f"Results: total={reward['total']:.4f} "
-                f"(proj={reward['proj']:.4f}, anchor={reward['anchor']:.4f}, "
-                f"conf={reward['conf']:.4f})")
+                f"(scene={reward['scene']:.4f}, motion={reward['motion']:.4f}, "
+                f"gate={reward['motion_gate']:.2f}, shape={reward['shape']:.4f}, "
+                f"smooth={reward['smoothness']:.4f})")
 
     os.makedirs(args.output_dir, exist_ok=True)
     result_name = f"{video_path.stem}_cal_result.json"
@@ -118,18 +133,19 @@ def main():
 
     result = {
         "video": str(video_path.resolve()),
-        "reward": {
-            "total": reward["total"],
-            "proj": reward["proj"],
-            "anchor": reward["anchor"],
-            "conf": reward["conf"],
-        },
+        "reward": reward,
         "config": {
             "da3_model": args.da3_model,
             "process_res": args.process_res,
             "max_frames": args.max_frames,
-            "reward_stride": args.reward_stride,
-            "keep_ratio": args.keep_ratio,
+            "image_diff_threshold": args.image_diff_threshold,
+            "image_vote_ratio": args.image_vote_ratio,
+            "depth_change_threshold": args.depth_change_threshold,
+            "min_motion_threshold": args.min_motion_threshold,
+            "tau_smooth": args.tau_smooth,
+            "tau_shape": args.tau_shape,
+            "motion_shape_weight": args.motion_shape_weight,
+            "motion_smooth_weight": args.motion_smooth_weight,
         },
     }
 
