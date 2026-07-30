@@ -195,6 +195,91 @@ class DA3GeoReward:
             "unknown_ratio": float(masks["global_unknown"].mean()),
         }
 
+    def compute_reward_early(self, frames_pil):
+        """
+        Simplified reward for early checkpoint (high-noise pred_x0).
+
+        Only uses motion_gate and R_scene — skips R_shape/R_smoothness which
+        are unstable on noisy intermediate frames.
+
+        Formula: early_score = motion_gate * (0.4 * R_scene + 0.6 * motion_gate)
+        """
+        pred = self.model.inference(frames_pil, process_res=self.process_res)
+
+        depths = pred.depth
+        extrinsics = pred.extrinsics
+        intrinsics = pred.intrinsics
+        conf = pred.conf
+
+        if extrinsics is None or intrinsics is None:
+            return self._fallback_result()
+
+        images = prepare_da3_aligned_images(frames_pil, pred)
+
+        masks = build_static_dynamic_masks(
+            images=images,
+            depths=depths,
+            conf=conf,
+            image_diff_threshold=self.cfg.image_diff_threshold,
+            image_vote_ratio=self.cfg.image_vote_ratio,
+            depth_change_threshold=self.cfg.depth_change_threshold,
+            min_component_area_ratio=self.cfg.min_component_area_ratio,
+            morph_kernel_size=self.cfg.morph_kernel_size,
+        )
+
+        scene = self._compute_scene_reward(
+            depths=depths,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+            conf=conf,
+            static_mask=masks["global_static"],
+        )
+
+        _, point_clouds, scene_scale = self._build_dynamic_geometry(
+            depths=depths,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+            frame_dynamic_masks=masks["frame_dynamic"],
+            global_static_mask=masks["global_static"],
+        )
+
+        from .motion_reward import robust_centroid
+        centroids = []
+        for pc in point_clouds:
+            if pc is not None and len(pc) > 0:
+                c = robust_centroid(pc)
+                if c is not None:
+                    centroids.append(c)
+
+        if len(centroids) >= 2 and scene_scale > 0:
+            centroids_arr = np.array(centroids)
+            displacements = np.linalg.norm(np.diff(centroids_arr, axis=0), axis=1)
+            speeds = displacements / scene_scale
+            median_speed = float(np.median(speeds))
+            motion_gate = min(1.0, median_speed / (self.cfg.min_motion_threshold + 1e-8))
+        else:
+            motion_gate = 0.0
+
+        total = motion_gate * (0.4 * scene["reward"] + 0.6 * motion_gate)
+
+        return {
+            "total": float(total),
+            "version": "v1_early",
+            "scene": float(scene["reward"]),
+            "motion_gate": float(motion_gate),
+            "motion": 0.0,
+            "shape": 0.0,
+            "smoothness": 0.0,
+            "motion_energy": float(motion_gate),
+            "scene_proj_error": scene.get("proj_error"),
+            "scene_anchor_error": scene.get("anchor_error"),
+            "shape_error": None,
+            "smoothness_error": None,
+            "static_ratio": float(masks["global_static"].mean()),
+            "dynamic_ratio": float(masks["global_dynamic"].mean()),
+            "unknown_ratio": float(masks["global_unknown"].mean()),
+        }
+
     def _compute_scene_reward(self, depths, extrinsics, intrinsics, conf, static_mask):
         """
         Compute R_scene: projection + anchor consistency on static regions only.

@@ -152,23 +152,28 @@ class GeoRewardBoNOffline:
 
 class GeoRewardBoNProgressive:
     """
-    Progressive elimination Best-of-N pipeline.
+    Two-stage fixed-ratio progressive elimination Best-of-N pipeline.
 
-    Instead of generating all N candidates to completion, this pipeline
-    inserts σ-based checkpoints during denoising.  At each checkpoint the
-    predicted clean latent (pred_x0) is decoded and scored; statistically
-    inferior candidates are eliminated so that remaining DiT steps only
-    run on survivors.
+    Flow:
+      N=8 candidates start → Step 15 early checkpoint → eliminate bottom 50% →
+      4 survivors → Step 25 mid checkpoint → eliminate bottom 50% →
+      2 survivors → Step 40 final → pick best.
 
-    Checkpoint behaviour is controlled by ``sigma_checkpoints`` -- a list
-    of σ thresholds, e.g. ``[0.65, 0.45]``.  At each checkpoint, candidates
-    whose reward falls below ``mean - elimination_std * std`` are dropped.
+    Compute savings: 8×15 + 4×10 + 2×15 = 190 DiT steps vs 320 (original).
 
-    Every decoded checkpoint video is saved to disk for visual inspection.
+    Checkpoints are defined by σ thresholds (default [0.83, 0.63]) so the
+    mechanism adapts if the total step count changes.
+
+    Early checkpoint uses a simplified reward (motion_gate + R_scene only)
+    since R_shape/R_smoothness are unstable on noisy pred_x0.
+    Mid and final checkpoints use the full reward.
     """
 
-    DEFAULT_SIGMA_CHECKPOINTS = [0.65, 0.45]
-    DEFAULT_ELIMINATION_STD = 1.5
+    DEFAULT_SIGMA_CHECKPOINTS = [0.83, 0.63]
+    DEFAULT_ELIMINATION_RATIO = 0.5
+    DEFAULT_MIN_SURVIVORS = 2
+    DEFAULT_SCORE_EPSILON = 0.02
+    DEFAULT_EARLY_MAX_FRAMES = 12
 
     def __init__(
         self,
@@ -177,16 +182,31 @@ class GeoRewardBoNProgressive:
         frame_indices=None,
         max_frames=20,
         sigma_checkpoints=None,
-        elimination_std=None,
+        elimination_ratio=None,
+        min_survivors=None,
+        score_epsilon=None,
+        early_max_frames=None,
     ):
         self.wan = wan_i2v
         self.reward = da3_reward
         self.frame_indices = frame_indices
         self.max_frames = max_frames
         self.sigma_checkpoints = sigma_checkpoints or self.DEFAULT_SIGMA_CHECKPOINTS
-        self.elimination_std = (
-            elimination_std if elimination_std is not None
-            else self.DEFAULT_ELIMINATION_STD
+        self.elimination_ratio = (
+            elimination_ratio if elimination_ratio is not None
+            else self.DEFAULT_ELIMINATION_RATIO
+        )
+        self.min_survivors = (
+            min_survivors if min_survivors is not None
+            else self.DEFAULT_MIN_SURVIVORS
+        )
+        self.score_epsilon = (
+            score_epsilon if score_epsilon is not None
+            else self.DEFAULT_SCORE_EPSILON
+        )
+        self.early_max_frames = (
+            early_max_frames if early_max_frames is not None
+            else self.DEFAULT_EARLY_MAX_FRAMES
         )
 
     def generate(
@@ -201,7 +221,7 @@ class GeoRewardBoNProgressive:
         **wan_kwargs,
     ):
         """
-        Progressive elimination BoN.
+        Two-stage fixed-ratio progressive elimination BoN.
 
         Args:
             prompt: text prompt.
@@ -219,11 +239,6 @@ class GeoRewardBoNProgressive:
         """
         if N < 1:
             raise ValueError(f"N must be >= 1, got {N}.")
-        if not np.isfinite(self.elimination_std) or self.elimination_std < 0:
-            raise ValueError(
-                "elimination_std must be a finite non-negative number, "
-                f"got {self.elimination_std}."
-            )
 
         validated_sigmas = []
         for value in self.sigma_checkpoints:
@@ -240,12 +255,18 @@ class GeoRewardBoNProgressive:
         else:
             indices = sample_frames(frame_num, self.max_frames)
 
+        early_indices = sample_frames(frame_num, self.early_max_frames)
+
         if seed_base is None:
             seed_base = random.randint(0, 2**31 - 1)
 
         seeds = [seed_base + i for i in range(N)]
 
         print(f"[BoNProgressive] Preparing {N} candidates (seeds {seeds[0]}..{seeds[-1]})")
+        print(f"[BoNProgressive] Checkpoints: σ={validated_sigmas}, "
+              f"elimination_ratio={self.elimination_ratio}, "
+              f"min_survivors={self.min_survivors}, "
+              f"epsilon={self.score_epsilon}")
         state = self.wan.prepare_progressive(
             input_prompt=prompt,
             img=image,
@@ -258,6 +279,7 @@ class GeoRewardBoNProgressive:
                 state=state,
                 seeds=seeds,
                 indices=indices,
+                early_indices=early_indices,
                 sigma_checkpoints=validated_sigmas,
                 output_dir=output_dir,
                 save_fn=save_fn,
@@ -271,18 +293,18 @@ class GeoRewardBoNProgressive:
         state,
         seeds,
         indices,
+        early_indices,
         sigma_checkpoints,
         output_dir,
         save_fn,
     ):
-        """Run progressive denoising for an already prepared shared state."""
+        """Run progressive denoising with fixed-ratio elimination."""
         total_steps = len(state['timesteps'])
         checkpoint_steps = []
         seen_end_steps = set()
 
         for sigma_target in sorted(sigma_checkpoints, reverse=True):
             end_step = self.wan.find_step_for_sigma(state, sigma_target)
-            # A checkpoint at total_steps would duplicate the final decode.
             if end_step is None or not 0 < end_step < total_steps:
                 continue
             if end_step in seen_end_steps:
@@ -324,6 +346,7 @@ class GeoRewardBoNProgressive:
             end_step = checkpoint["end_step"]
             actual_sigma = checkpoint["actual_sigma"]
             is_final = (end_step == total_steps)
+            is_early = (ckpt_idx == 0 and not is_final)
             phase_name = (
                 "final_sigma0.00" if is_final
                 else f"checkpoint{ckpt_idx + 1}_sigma{actual_sigma:.4f}"
@@ -335,6 +358,8 @@ class GeoRewardBoNProgressive:
             last_preds, pre_step_latents = self.wan.denoise_candidates(
                 state, alive, cur_step, end_step)
             cur_step = end_step
+
+            frame_indices_for_phase = early_indices if is_early else indices
 
             scored = []
             for cand_idx in alive:
@@ -354,14 +379,20 @@ class GeoRewardBoNProgressive:
                         video_tensor, seed, phase_name, output_dir, save_fn)
 
                 frames_pil = wan_output_to_da3_input(video_tensor)
-                sampled = [frames_pil[i] for i in indices if i < len(frames_pil)]
-                r = self.reward.compute_reward(sampled)
+                sampled = [frames_pil[i] for i in frame_indices_for_phase
+                           if i < len(frames_pil)]
+
+                if is_early:
+                    r = self.reward.compute_reward_early(sampled)
+                else:
+                    r = self.reward.compute_reward(sampled)
+
                 rewards_log[f"seed_{seed}"][phase_name] = r
-                scored.append((cand_idx, r, None))
+                scored.append((cand_idx, r))
 
                 print(f"  seed_{seed}: total={r['total']:.4f} "
-                      f"(scene={r['scene']:.4f}, gate={r['motion_gate']:.2f}, "
-                      f"shape={r['shape']:.4f}, smooth={r['smoothness']:.4f})")
+                      f"(scene={r['scene']:.4f}, gate={r['motion_gate']:.2f}"
+                      f"{', shape=' + format(r['shape'], '.4f') + ', smooth=' + format(r['smoothness'], '.4f') if not is_early else ''})")
 
                 if is_final:
                     total = float(r.get('total', float('nan')))
@@ -384,7 +415,7 @@ class GeoRewardBoNProgressive:
                 break
 
             alive, _ = self._eliminate(
-                scored, seeds, eliminated_at, phase_name)
+                scored, seeds, eliminated_at, phase_name, is_early)
 
         if best_cand_idx is None:
             raise RuntimeError("No final candidate was decoded and scored.")
@@ -401,64 +432,62 @@ class GeoRewardBoNProgressive:
 
         return best_video, result_log, best_seed
 
-    def _eliminate(self, scored, seeds, eliminated_at, phase_name):
+    def _eliminate(self, scored, seeds, eliminated_at, phase_name, is_early):
         """
-        Soft elimination: only drop candidates below mean - k*std.
-        Always keep at least 2 candidates alive.
+        Fixed-ratio elimination: drop bottom elimination_ratio candidates.
+
+        Safety: if the score gap between the last survivor and first eliminated
+        is smaller than score_epsilon, keep one extra candidate.
+        Always keep at least min_survivors alive.
         """
-        if len(scored) <= 2:
-            return [c for c, _, _ in scored], []
+        if len(scored) <= self.min_survivors:
+            return [c for c, _ in scored], []
 
         totals = np.array([
-            float(r.get('total', float('nan'))) for _, r, _ in scored
+            float(r.get('total', float('nan'))) for _, r in scored
         ], dtype=np.float64)
         finite = np.isfinite(totals)
 
-        # A systemic reward failure must not silently eliminate every
-        # candidate.  Keep the phase unchanged so a later checkpoint can
-        # still recover and produce diagnostics.
         if not finite.any():
             print(
                 f"  WARNING: no finite rewards at {phase_name}; "
                 "skipping elimination."
             )
-            return [c for c, _, _ in scored], []
+            return [c for c, _ in scored], []
 
-        mean_t = totals[finite].mean()
-        std_t = totals[finite].std()
-        threshold = mean_t - self.elimination_std * std_t
+        ranked = sorted(
+            range(len(scored)),
+            key=lambda i: totals[i] if np.isfinite(totals[i]) else -float("inf"),
+            reverse=True,
+        )
+
+        keep_count = max(
+            self.min_survivors,
+            len(scored) - int(len(scored) * self.elimination_ratio),
+        )
+
+        if keep_count < len(scored):
+            last_keep_score = totals[ranked[keep_count - 1]]
+            first_elim_score = totals[ranked[keep_count]]
+            if (np.isfinite(last_keep_score) and np.isfinite(first_elim_score)
+                    and (last_keep_score - first_elim_score) < self.score_epsilon):
+                keep_count = min(keep_count + 1, len(scored))
 
         survivors = []
         eliminated = []
-        for (cand_idx, r, _), total in zip(scored, totals):
-            if np.isfinite(total) and total >= threshold:
+        survivor_set = set(ranked[:keep_count])
+        for idx, (cand_idx, _) in enumerate(scored):
+            if idx in survivor_set:
                 survivors.append(cand_idx)
             else:
                 eliminated.append(cand_idx)
                 eliminated_at[f"seed_{seeds[cand_idx]}"] = phase_name
 
-        if len(survivors) < 2:
-            ranked = sorted(
-                scored,
-                key=lambda x: (
-                    float(x[1].get('total', float('nan')))
-                    if np.isfinite(float(x[1].get('total', float('nan'))))
-                    else -float("inf")
-                ),
-                reverse=True,
-            )
-            survivors = [c for c, _, _ in ranked[:2]]
-            eliminated = [c for c, _, _ in ranked[2:]]
-            for cand_idx in survivors:
-                eliminated_at.pop(f"seed_{seeds[cand_idx]}", None)
-            eliminated_at.update({
-                f"seed_{seeds[c]}": phase_name for c in eliminated
-            })
-
         if eliminated:
             elim_seeds = [seeds[c] for c in eliminated]
+            surv_seeds = [seeds[c] for c in survivors]
             print(f"  Eliminated {len(eliminated)} candidates: seeds {elim_seeds} "
-                  f"(threshold={threshold:.4f})")
+                  f"(kept {len(survivors)}: seeds {surv_seeds})")
 
         return survivors, eliminated
 
@@ -476,8 +505,12 @@ class GeoRewardBoNProgressive:
                           best_seed, sigma_checkpoints, elapsed,
                           checkpoint_steps):
         return {
-            "mode": "progressive_elimination",
+            "mode": "progressive_elimination_v2",
             "sigma_checkpoints": sigma_checkpoints,
+            "elimination_ratio": self.elimination_ratio,
+            "min_survivors": self.min_survivors,
+            "score_epsilon": self.score_epsilon,
+            "early_max_frames": self.early_max_frames,
             "checkpoint_plan": [
                 {
                     "completed_steps": item["end_step"],
@@ -487,7 +520,6 @@ class GeoRewardBoNProgressive:
                 }
                 for item in checkpoint_steps
             ],
-            "elimination_std": self.elimination_std,
             "seeds": seeds,
             "best_seed": best_seed,
             "total_time_sec": elapsed,

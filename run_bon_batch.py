@@ -59,10 +59,16 @@ def parse_args():
     parser.add_argument("--no_progressive", action="store_true",
                         help="Disable progressive elimination (use original sequential BoN).")
     parser.add_argument("--sigma_checkpoints", type=float, nargs="+",
-                        default=[0.65, 0.45],
-                        help="σ thresholds for early checkpoints (default: 0.65 0.45).")
-    parser.add_argument("--elimination_std", type=float, default=1.5,
-                        help="Elimination threshold: mean - k*std (default: 1.5).")
+                        default=[0.83, 0.63],
+                        help="σ thresholds for checkpoints (default: 0.83 0.63).")
+    parser.add_argument("--elimination_ratio", type=float, default=0.5,
+                        help="Fraction of candidates to eliminate at each checkpoint (default: 0.5).")
+    parser.add_argument("--min_survivors", type=int, default=2,
+                        help="Minimum number of survivors at any checkpoint (default: 2).")
+    parser.add_argument("--score_epsilon", type=float, default=0.02,
+                        help="Score indistinguishability threshold for safety keep (default: 0.02).")
+    parser.add_argument("--early_max_frames", type=int, default=12,
+                        help="Number of frames to sample for DA3 at early checkpoint (default: 12).")
 
     return parser.parse_args()
 
@@ -176,7 +182,10 @@ def main():
             da3_reward=da3_reward,
             max_frames=20,
             sigma_checkpoints=args.sigma_checkpoints,
-            elimination_std=args.elimination_std,
+            elimination_ratio=args.elimination_ratio,
+            min_survivors=args.min_survivors,
+            score_epsilon=args.score_epsilon,
+            early_max_frames=args.early_max_frames,
         )
 
     def _save_fn(tensor, path):

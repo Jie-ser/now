@@ -80,10 +80,16 @@ def parse_args():
     parser.add_argument("--no_progressive", action="store_true",
                         help="Disable progressive elimination (use original sequential BoN).")
     parser.add_argument("--sigma_checkpoints", type=float, nargs="+",
-                        default=[0.65, 0.45],
-                        help="σ thresholds for early checkpoints (default: 0.65 0.45).")
-    parser.add_argument("--elimination_std", type=float, default=1.5,
-                        help="Elimination threshold: mean - k*std (default: 1.5).")
+                        default=[0.83, 0.63],
+                        help="σ thresholds for checkpoints (default: 0.83 0.63).")
+    parser.add_argument("--elimination_ratio", type=float, default=0.5,
+                        help="Fraction of candidates to eliminate at each checkpoint (default: 0.5).")
+    parser.add_argument("--min_survivors", type=int, default=2,
+                        help="Minimum number of survivors at any checkpoint (default: 2).")
+    parser.add_argument("--score_epsilon", type=float, default=0.02,
+                        help="Score indistinguishability threshold for safety keep (default: 0.02).")
+    parser.add_argument("--early_max_frames", type=int, default=12,
+                        help="Number of frames to sample for DA3 at early checkpoint (default: 12).")
 
     # DA3 model args
     parser.add_argument("--da3_model", type=str, default="depth-anything/DA3NESTED-GIANT-LARGE-1.1",
@@ -177,14 +183,17 @@ def run_bon(args):
     if use_progressive:
         logger.info("Mode: Progressive Elimination BoN "
                      f"(σ checkpoints: {args.sigma_checkpoints}, "
-                     f"elimination_std: {args.elimination_std})")
+                     f"elimination_ratio: {args.elimination_ratio})")
 
         bon = GeoRewardBoNProgressive(
             wan_i2v=wan_i2v,
             da3_reward=da3_reward,
             max_frames=args.max_frames,
             sigma_checkpoints=args.sigma_checkpoints,
-            elimination_std=args.elimination_std,
+            elimination_ratio=args.elimination_ratio,
+            min_survivors=args.min_survivors,
+            score_epsilon=args.score_epsilon,
+            early_max_frames=args.early_max_frames,
         )
 
         def _save_fn(tensor, path):
@@ -226,7 +235,10 @@ def run_bon(args):
             "reward_version": "v1",
             "progressive": True,
             "sigma_checkpoints": args.sigma_checkpoints,
-            "elimination_std": args.elimination_std,
+            "elimination_ratio": args.elimination_ratio,
+            "min_survivors": args.min_survivors,
+            "score_epsilon": args.score_epsilon,
+            "early_max_frames": args.early_max_frames,
             "da3_model": args.da3_model,
             "process_res": args.process_res,
             "max_frames": args.max_frames,
