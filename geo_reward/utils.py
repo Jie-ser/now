@@ -3,9 +3,9 @@ from PIL import Image
 import torch
 
 
-def wan_output_to_da3_input(video_tensor):
+def wan_output_to_pil(video_tensor):
     """
-    Convert Wan2.2 output tensor to DA3 input format.
+    Convert Wan2.2 output tensor to list of PIL Images.
 
     Args:
         video_tensor: Wan2.2 output, shape (3, T, H, W), range [-1, 1], torch.Tensor
@@ -21,6 +21,10 @@ def wan_output_to_da3_input(video_tensor):
 
     frames = [Image.fromarray(video[t]) for t in range(video.shape[0])]
     return frames
+
+
+# Backward-compatible alias for V1
+wan_output_to_da3_input = wan_output_to_pil
 
 
 def sample_frames(total_frames=81, max_frames=20):
@@ -42,3 +46,21 @@ def sample_frames(total_frames=81, max_frames=20):
     for i in range(1, max_frames):
         indices.append(int(round(i * step)))
     return sorted(set(indices))
+
+
+def transform_to_camera(pts_world, w2c):
+    """
+    Transform world-coordinate points to camera coordinates.
+
+    Args:
+        pts_world: (..., 3) world-coordinate points (torch tensor).
+        w2c: (4, 4) world-to-camera transform.
+
+    Returns:
+        (..., 3) points in camera coordinates.
+    """
+    original_shape = pts_world.shape
+    pts_flat = pts_world.reshape(-1, 3)
+    pts_homo = torch.cat([pts_flat, torch.ones_like(pts_flat[:, :1])], dim=-1)
+    pts_cam = (w2c @ pts_homo.T).T[:, :3]
+    return pts_cam.reshape(original_shape)

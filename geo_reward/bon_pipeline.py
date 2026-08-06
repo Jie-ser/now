@@ -1,5 +1,5 @@
 """
-Best-of-N sampling pipeline with DA3 GeoReward V1.
+Best-of-N sampling pipeline with GeoReward (V1: DA3, V2: 4RC).
 
 Generates N candidate videos with Wan2.2 I2V, scores each with GeoReward,
 and selects the geometrically most consistent one.
@@ -8,6 +8,9 @@ Includes:
 - GeoRewardBoN: original sequential BoN
 - GeoRewardBoNProgressive: progressive elimination BoN (σ-based checkpoints)
 - GeoRewardBoNOffline: offline scoring of pre-generated videos
+
+Supports reward_type='v1' (DA3) and reward_type='v2' (4RC) with automatic
+model offloading between DiT denoising and reward scoring phases.
 """
 
 import json
@@ -19,7 +22,7 @@ import numpy as np
 import torch
 
 from .da3_reward import DA3GeoReward
-from .utils import wan_output_to_da3_input, sample_frames
+from .utils import wan_output_to_pil, wan_output_to_da3_input, sample_frames
 
 
 class GeoRewardBoN:
@@ -526,3 +529,267 @@ class GeoRewardBoNProgressive:
             "rewards": rewards_log,
             "eliminated_at": eliminated_at,
         }
+
+
+class GeoRewardBoNProgressiveV2(GeoRewardBoNProgressive):
+    """
+    Two-stage fixed-ratio progressive elimination using 4RC V2 reward.
+
+    Key differences from GeoRewardBoNProgressive:
+    - Uses ReconstructionReward (4RC) instead of DA3GeoReward
+    - All checkpoints use the SAME reward formula (no simplified early version)
+    - Supports model offloading: DiT ↔ 4RC alternation to fit in GPU memory
+    - Only input frame count differs between checkpoints (12 early, 20 mid/final)
+    """
+
+    def __init__(
+        self,
+        wan_i2v,
+        recon_reward,
+        frame_indices=None,
+        max_frames=20,
+        sigma_checkpoints=None,
+        elimination_ratio=None,
+        min_survivors=None,
+        score_epsilon=None,
+        early_max_frames=None,
+        offload_models=True,
+    ):
+        """
+        Args:
+            wan_i2v: Wan2.2 I2V model wrapper.
+            recon_reward: ReconstructionReward instance (V2).
+            offload_models: If True, swap DiT/4RC between CPU/GPU at checkpoints.
+        """
+        super().__init__(
+            wan_i2v=wan_i2v,
+            da3_reward=None,
+            frame_indices=frame_indices,
+            max_frames=max_frames,
+            sigma_checkpoints=sigma_checkpoints,
+            elimination_ratio=elimination_ratio,
+            min_survivors=min_survivors,
+            score_epsilon=score_epsilon,
+            early_max_frames=early_max_frames,
+        )
+        self.recon_reward = recon_reward
+        self.offload_models = offload_models
+
+    @property
+    def reward(self):
+        """V2 does not use DA3 reward. Fail loud if anyone calls through."""
+        raise AttributeError(
+            "GeoRewardBoNProgressiveV2 uses self.recon_reward (4RC), "
+            "not self.reward (DA3). Use self.recon_reward.compute_reward() instead."
+        )
+
+    @reward.setter
+    def reward(self, value):
+        # Silently absorb parent __init__ setting self.reward = da3_reward.
+        # The value is discarded; V2 uses self.recon_reward exclusively.
+        # If parent code evolves to read self.reward outside _generate_prepared,
+        # the property getter above will raise immediately.
+        pass
+
+    def _generate_prepared(
+        self,
+        state,
+        seeds,
+        indices,
+        early_indices,
+        sigma_checkpoints,
+        output_dir,
+        save_fn,
+    ):
+        """Run progressive denoising with V2 reward and model offloading."""
+        total_steps = len(state['timesteps'])
+        checkpoint_steps = []
+        seen_end_steps = set()
+
+        for sigma_target in sorted(sigma_checkpoints, reverse=True):
+            end_step = self.wan.find_step_for_sigma(state, sigma_target)
+            if end_step is None or not 0 < end_step < total_steps:
+                continue
+            if end_step in seen_end_steps:
+                print(
+                    f"[BoNProgressiveV2] Skipping duplicate checkpoint "
+                    f"sigma={sigma_target:.4f} at completed step {end_step}."
+                )
+                continue
+
+            actual_step_idx = end_step - 1
+            actual_sigma = float(
+                state['candidates'][0]['scheduler'].sigmas[actual_step_idx])
+            checkpoint_steps.append({
+                "end_step": end_step,
+                "target_sigma": sigma_target,
+                "actual_sigma": actual_sigma,
+                "scheduler_step_index": actual_step_idx,
+            })
+            seen_end_steps.add(end_step)
+
+        checkpoint_steps.sort(key=lambda item: item["end_step"])
+        checkpoint_steps.append({
+            "end_step": total_steps,
+            "target_sigma": 0.0,
+            "actual_sigma": 0.0,
+            "scheduler_step_index": total_steps,
+        })
+
+        alive = list(range(len(seeds)))
+        rewards_log = {f"seed_{s}": {} for s in seeds}
+        eliminated_at = {}
+        cur_step = 0
+        t_start = time.time()
+        best_video = None
+        best_cand_idx = None
+        best_final_score = -float("inf")
+
+        for ckpt_idx, checkpoint in enumerate(checkpoint_steps):
+            end_step = checkpoint["end_step"]
+            actual_sigma = checkpoint["actual_sigma"]
+            is_final = (end_step == total_steps)
+            is_early = (ckpt_idx == 0 and not is_final)
+            phase_name = (
+                "final_sigma0.00" if is_final
+                else f"checkpoint{ckpt_idx + 1}_sigma{actual_sigma:.4f}"
+            )
+
+            print(f"\n[BoNProgressiveV2] Phase: {phase_name} "
+                  f"(steps {cur_step}->{end_step}, {len(alive)} alive candidates)")
+
+            last_preds, pre_step_latents = self.wan.denoise_candidates(
+                state, alive, cur_step, end_step)
+            cur_step = end_step
+
+            frame_indices_for_phase = early_indices if is_early else indices
+
+            # Phase 1: Decode all candidates (VAE on GPU, DiT can stay)
+            # Move decoded tensors to CPU immediately to free GPU for 4RC
+            decoded_videos = {}
+            for cand_idx in alive:
+                if is_final:
+                    latent_to_decode = state['candidates'][cand_idx]['latent']
+                else:
+                    latent_to_decode = self.wan.extract_pred_x0(
+                        state, cand_idx, last_preds[cand_idx],
+                        pre_step_latents[cand_idx])
+
+                video_tensor = self.wan.decode_latent(latent_to_decode)
+
+                if output_dir is not None:
+                    seed = seeds[cand_idx]
+                    self._save_video(
+                        video_tensor, seed, phase_name, output_dir, save_fn)
+
+                decoded_videos[cand_idx] = video_tensor.cpu()
+
+                del latent_to_decode, video_tensor
+                torch.cuda.empty_cache()
+
+            # Phase 2: Offload DiT + VAE, load 4RC for scoring
+            if self.offload_models:
+                self._offload_dit()
+                self._offload_vae()
+                self._load_4rc()
+
+            scored = []
+            for cand_idx in alive:
+                seed = seeds[cand_idx]
+                video_tensor = decoded_videos[cand_idx]
+
+                frames_pil = wan_output_to_pil(video_tensor)
+                sampled = [frames_pil[i] for i in frame_indices_for_phase
+                           if i < len(frames_pil)]
+
+                # V2: same reward formula for all checkpoints
+                r = self.recon_reward.compute_reward(sampled)
+
+                rewards_log[f"seed_{seed}"][phase_name] = r
+                scored.append((cand_idx, r))
+
+                print(f"  seed_{seed}: total={r['total']:.4f} "
+                      f"(R_static={r['R_static']:.4f}, "
+                      f"R_dynamic={r['R_dynamic']:.4f}, "
+                      f"R_motion={r['R_motion']:.4f}, "
+                      f"G_anchor={r['G_anchor']:.2f})")
+
+                if is_final:
+                    total = float(r.get('total', float('nan')))
+                    selection_score = total if np.isfinite(total) else -float("inf")
+                    if best_cand_idx is None or selection_score > best_final_score:
+                        if best_video is not None:
+                            del best_video
+                        best_video = video_tensor
+                        best_cand_idx = cand_idx
+                        best_final_score = selection_score
+                    else:
+                        del video_tensor
+                else:
+                    del video_tensor
+
+                torch.cuda.empty_cache()
+
+            del decoded_videos
+
+            # Phase 3: Offload 4RC, reload DiT + VAE for next denoising phase
+            if self.offload_models:
+                self._offload_4rc()
+                if not is_final:
+                    self._load_dit()
+                    self._load_vae()
+
+            if is_final:
+                break
+
+            alive, _ = self._eliminate(
+                scored, seeds, eliminated_at, phase_name, is_early)
+
+        if best_cand_idx is None:
+            raise RuntimeError("No final candidate was decoded and scored.")
+
+        best_seed = seeds[best_cand_idx]
+        elapsed = time.time() - t_start
+        result_log = self._build_result_log(
+            seeds, rewards_log, eliminated_at, best_seed,
+            sigma_checkpoints, elapsed, checkpoint_steps)
+        result_log["reward_type"] = "v2_4rc"
+
+        print(f"\n[BoNProgressiveV2] Best: seed_{best_seed} "
+              f"(total={rewards_log[f'seed_{best_seed}']['final_sigma0.00']['total']:.4f}) "
+              f"in {elapsed:.1f}s")
+
+        return best_video, result_log, best_seed
+
+    def _offload_dit(self):
+        """Move DiT model to CPU to free GPU memory for 4RC."""
+        if hasattr(self.wan, 'model') and self.wan.model is not None:
+            self.wan.model.cpu()
+            torch.cuda.empty_cache()
+
+    def _load_dit(self):
+        """Move DiT model back to GPU for denoising."""
+        if hasattr(self.wan, 'model') and self.wan.model is not None:
+            self.wan.model.cuda()
+
+    def _offload_vae(self):
+        """Move VAE to CPU to free GPU memory for 4RC."""
+        if hasattr(self.wan, 'vae') and self.wan.vae is not None:
+            self.wan.vae.cpu()
+            torch.cuda.empty_cache()
+
+    def _load_vae(self):
+        """Move VAE back to GPU for decoding."""
+        if hasattr(self.wan, 'vae') and self.wan.vae is not None:
+            self.wan.vae.cuda()
+
+    def _offload_4rc(self):
+        """Move 4RC model to CPU."""
+        if self.recon_reward.model is not None:
+            self.recon_reward.model.cpu()
+            torch.cuda.empty_cache()
+
+    def _load_4rc(self):
+        """Move 4RC model to GPU for scoring."""
+        if self.recon_reward.model is not None:
+            self.recon_reward.model.cuda()

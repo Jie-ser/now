@@ -7,12 +7,15 @@
 ```
 now/
 ├── geo_reward/                  # 核心模块
-│   ├── __init__.py              # 导出 DA3GeoReward, GeometryRewardConfig, GeoRewardBoN, GeoRewardBoNProgressive
-│   ├── da3_reward.py            # DA3GeoReward 主类 + GeometryRewardConfig + compute_reward_early
-│   ├── region_masks.py          # 静态/动态区域分割（帧差+深度变化率+OR组合）
-│   ├── motion_reward.py         # 运动质量评分（motion_gate + R_shape + R_smoothness）
-│   ├── bon_pipeline.py          # GeoRewardBoN / GeoRewardBoNProgressive（两阶段固定比例淘汰）/ GeoRewardBoNOffline
-│   └── utils.py                 # 格式转换（wan→PIL）、均匀抽帧
+│   ├── __init__.py              # 导出 DA3GeoReward, GeometryRewardConfig, ReconstructionReward, ReconRewardConfig, GeoRewardBoN, GeoRewardBoNProgressive, GeoRewardBoNProgressiveV2, GeometricGuidance
+│   ├── da3_reward.py            # DA3GeoReward 主类 + GeometryRewardConfig + compute_reward_early（V1 保留）
+│   ├── recon_reward.py          # 【V2 新增】ReconstructionReward + ReconRewardConfig（4RC 显式几何一致性）
+│   ├── fourrc_adapter.py        # 【V2 新增】4RC 接口适配（PIL→view、valid_mask、dynamic_mask）
+│   ├── guidance.py              # 【V2 新增】梯度引导模块（Phase 3，GeometricGuidance）
+│   ├── region_masks.py          # 静态/动态区域分割（帧差+深度变化率+OR组合）（V1 保留）
+│   ├── motion_reward.py         # 运动质量评分（motion_gate + R_shape + R_smoothness）（V1 保留）
+│   ├── bon_pipeline.py          # GeoRewardBoN / GeoRewardBoNProgressive（V1）/ GeoRewardBoNProgressiveV2（V2+模型交替加载）/ GeoRewardBoNOffline
+│   └── utils.py                 # 格式转换（wan→PIL）、均匀抽帧、坐标变换
 ├── run_bon.py                   # 单条 BoN CLI（--mode bon / score）
 ├── run_bon_batch.py             # 批量 BoN CLI（--start/--end，模型只加载一次）
 ├── score_video.py               # 独立视频评分 CLI（支持 .mp4/.pt）
@@ -23,8 +26,10 @@ now/
 ├── batch_prompts_inputs_real_3.json
 ├── batch_prompts_inputs_real_4.json
 ├── Progressive_Elimination_BoN_Technical_Report.md  # 渐进淘汰实验报告
+├── GeoReward_V2_Reconstruction_Quality_Reward_Proposal.md  # V2 方案文档
 ├── GeoReward_SchemeA_Geometric_Motion_Execution_Plan.md  # V1 执行方案文档
 ├── Wan2.2/                      # 阿里视频生成模型（14B DiT, Flow Matching）
+├── 4RC-main/                    # 4RC 4D 几何基础模型（重建+追踪）
 ├── Depth-Anything-3-main/       # ByteDance 深度估计模型（DA3）
 ├── VGGTomega/                   # VGGT-Omega 参考（几何基础模型）
 ├── WMReward-main/               # Meta 参考实现（VJEPA-2 reward）
@@ -70,6 +75,70 @@ early_score = motion_gate × (0.4 × R_scene + 0.6 × motion_gate)
 - DA3 confidence 按帧内分位数做可靠性 mask，不作为正向 Reward
 - 形态学开闭 + 连通区域过滤去噪点
 - 同时维护 global mask（用于 R_scene）和 per-frame mask（用于 R_motion）
+
+## Reward V2 设计（4RC 显式几何一致性）
+
+### 核心思路
+
+用 4RC 的显式 3D 输出（pts、track、extrinsics）计算几何一致性。conf/conf_track 仅作为 valid mask，不参与分数计算。单模型、一次推理、后验区分 static/dynamic。
+
+```
+R_total = G_anchor × (0.40 × R_static + 0.40 × R_dynamic + 0.20 × R_motion)
+```
+
+- `G_anchor`：首帧静态区域深度合理性门控
+- `R_static`：静态区域跨帧深度重投影误差 + forward-backward cycle + 有效重投影比例
+- `R_dynamic`：动态区域覆盖率 + 3D 轨迹加速度 penalty + 速度平滑度
+- `R_motion`：相机加速度 penalty + 旋转加速度 penalty + motion gate + 瞬移 penalty
+- 所有 checkpoint（early/mid/final）使用完全相同的 compute_reward 函数，区别只是输入帧数
+
+### 与 V1 的区别
+
+- 几何来源：DA3（3D，静态假设）→ 4RC（4D，原生动态支持）
+- 动态分割：帧差+深度变化率（手工）→ 4RC track 位移后验推断
+- 早期 Reward：简化公式 → 统一公式（帧数不同而已）
+- conf 角色：无 → 仅作为 valid mask（不作为分数）
+- 可微性：不可微 → 4RC forward 支持梯度（Phase 3）
+
+### Dynamic Mask（逐帧最大位移法）
+
+从 track 的逐帧最大位移推断 static/dynamic：`max_t ||track[t]|| > threshold × scene_scale`
+
+### 显存管理：模型交替加载
+
+```python
+# 去噪阶段：DiT on GPU, 4RC on CPU
+# Checkpoint 评分阶段：DiT on CPU, 4RC on GPU
+```
+
+`GeoRewardBoNProgressiveV2` 自动处理模型交替加载。
+
+### ReconRewardConfig 默认值
+
+```python
+static_weight = 0.40          # R_static 权重
+dynamic_weight = 0.40         # R_dynamic 权重
+motion_weight = 0.20          # R_motion 权重
+dynamic_threshold_ratio = 0.01  # 动态 mask 相对 scene_scale 的阈值
+tau_reproj = 0.10             # 重投影误差温度
+tau_accel = 0.05              # 加速度 penalty 温度
+tau_speed = 3.0               # 极端速度 penalty 温度
+tau_cam = 0.02                # 相机加速度温度
+tau_rot = 0.05                # 旋转加速度温度
+min_motion = 0.005            # 最低运动量
+conf_valid_quantile = 0.20    # conf 有效阈值分位数（Q20，保留 top 80%）
+image_size = 518              # 4RC 输入分辨率
+```
+
+### 梯度引导（Phase 3，待验证后启用）
+
+```python
+L_guidance = L_reproj + 0.5 × L_track_smoothness + 0.3 × L_anchor
+```
+
+- 对显式几何 loss 求梯度，不对 conf 求梯度
+- WMReward 风格归一化：`v_guided = v_pred + scale * norm_ratio * scaling_t * grad`
+- `GeometricGuidance` 类封装，通过 `should_guide(sigma_t)` 控制引导窗口
 
 ## Best-of-N 渐进淘汰设计（两阶段固定比例）
 
@@ -128,6 +197,16 @@ DEFAULT_SCORE_EPSILON = 0.02               # 分数不可区分阈值
 DEFAULT_EARLY_MAX_FRAMES = 12              # 早期 DA3 采帧数
 ```
 
+## 远程服务器路径
+
+```
+项目目录:  /pfs/mayuema/spj/now
+Wan2.2 权重: /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B
+DA3 模型:   /pfs/mayuema/spj/DA3/models/DA3NESTED-GIANT-LARGE-1.1
+4RC 模型:   /pfs/mayuema/spj/4RC/models/4RC  (待确认具体路径)
+输入图片:   /pfs/mayuema/spj/now/inputs/<子目录>/
+```
+
 ## 运行命令
 
 ```bash
@@ -138,7 +217,7 @@ export PYTHONPATH=$PYTHONPATH:$(pwd)/Wan2.2
 
 # Best-of-N 渐进淘汰（单条，默认）
 python run_bon.py \
-  --ckpt_dir /path/to/Wan2.2-I2V-A14B \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
   --image /path/to/first_frame.png \
   --prompt "动作指令" \
   --N 8 --size 480*832 --sample_shift 3.0 --t5_cpu
@@ -146,8 +225,8 @@ python run_bon.py \
 # Best-of-N 渐进淘汰（批量）
 python run_bon_batch.py \
   --start 1 --end 10 \
-  --ckpt_dir /path/to/Wan2.2-I2V-A14B \
-  --da3_model /path/to/DA3 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --da3_model /pfs/mayuema/spj/DA3/models/DA3NESTED-GIANT-LARGE-1.1 \
   --t5_cpu
 
 # 自定义淘汰参数
@@ -158,13 +237,13 @@ python run_bon_batch.py \
   --min_survivors 2 \
   --score_epsilon 0.02 \
   --early_max_frames 12 \
-  --ckpt_dir /path/to/Wan2.2-I2V-A14B \
-  --da3_model /path/to/DA3 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --da3_model /pfs/mayuema/spj/DA3/models/DA3NESTED-GIANT-LARGE-1.1 \
   --t5_cpu
 
 # 禁用渐进淘汰（原版顺序 BoN）
 python run_bon.py --no_progressive \
-  --ckpt_dir /path/to/Wan2.2-I2V-A14B \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
   --image /path/to/first_frame.png \
   --prompt "动作指令" \
   --N 8 --size 480*832
@@ -215,9 +294,13 @@ total_motion_weight = 0.70     # R_motion 在总分中的权重
 
 ## 开发计划
 
-- **V1**（当前）：Scene + Motion，显式区域分割 + 运动质量评分 + 两阶段渐进淘汰 BoN
-- **V2**（后续，依赖 V1 实验结果）：增加 R_interaction（机器人-物体交互一致性）
-- **Part 2**（更后续）：可微 DA3 + 梯度引导去噪 + 与 BoN 组合
+- **V1**（已完成代码）：DA3 Scene + Motion，显式区域分割 + 运动质量评分 + 两阶段渐进淘汰 BoN
+- **V2**（当前，代码已完成）：4RC 显式几何一致性 Reward（ReconstructionReward）
+  - Phase 0：Reward 信号验证（扰动退化实验 + 候选间方差分析 + V1 交叉验证）
+  - Phase 1：完整 BoN（4RC reward 选优 vs random vs V1）
+  - Phase 2：Progressive BoN（验证 early score 与 final score 相关性）
+  - Phase 3：梯度引导 + BoN（GeometricGuidance 模块已就绪，待 Phase 1/2 验证）
+- **Part 2**（更后续）：梯度引导去噪 + BoN 组合 + 下游机械臂任务验证
 
 ## 代码规范
 

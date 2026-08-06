@@ -1,0 +1,12 @@
+/.vscode
+/__pycache__
+/__PYCACHE__
+/**/__pycache__
+/**/__PYCACHE__
+/.venv
+
+/ckpts
+/test.ipynb
+/datasets
+/outputs
+/logs
