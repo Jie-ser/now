@@ -763,14 +763,18 @@ class GeoRewardBoNProgressiveV2(GeoRewardBoNProgressive):
 
     def _offload_dit(self):
         """Move DiT model to CPU to free GPU memory for 4RC."""
-        if hasattr(self.wan, 'model') and self.wan.model is not None:
-            self.wan.model.cpu()
-            torch.cuda.empty_cache()
+        if hasattr(self.wan, 'low_noise_model') and self.wan.low_noise_model is not None:
+            self.wan.low_noise_model.cpu()
+        if hasattr(self.wan, 'high_noise_model') and self.wan.high_noise_model is not None:
+            self.wan.high_noise_model.cpu()
+        torch.cuda.empty_cache()
 
     def _load_dit(self):
         """Move DiT model back to GPU for denoising."""
-        if hasattr(self.wan, 'model') and self.wan.model is not None:
-            self.wan.model.cuda()
+        if hasattr(self.wan, 'low_noise_model') and self.wan.low_noise_model is not None:
+            self.wan.low_noise_model.cuda()
+        if hasattr(self.wan, 'high_noise_model') and self.wan.high_noise_model is not None:
+            self.wan.high_noise_model.cuda()
 
     def _offload_vae(self):
         """Move VAE to CPU to free GPU memory for 4RC."""

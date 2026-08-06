@@ -350,7 +350,8 @@ def run_bon(args):
             candidates.append(video)
 
             if offload_models:
-                wan_i2v.model.cpu()
+                wan_i2v.low_noise_model.cpu()
+                wan_i2v.high_noise_model.cpu()
                 torch.cuda.empty_cache()
                 fourrc_model.cuda()
 
@@ -365,7 +366,8 @@ def run_bon(args):
             if offload_models:
                 fourrc_model.cpu()
                 torch.cuda.empty_cache()
-                wan_i2v.model.cuda()
+                wan_i2v.low_noise_model.cuda()
+                wan_i2v.high_noise_model.cuda()
 
             logger.info(f"  Candidate {i+1}/{args.N} (seed={seed}): "
                         f"total={r['total']:.4f} "
