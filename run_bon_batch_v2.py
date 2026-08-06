@@ -351,8 +351,14 @@ def main():
                 continue
 
             best_idx = max(range(len(rewards)), key=lambda i: rewards[i]["total"])
-            best_path = str(case_dir / f"seed_{seed_base + best_idx}_BEST.mp4")
-            _save_fn(candidates[best_idx], best_path)
+            ranked_indices = sorted(range(len(rewards)),
+                                    key=lambda i: rewards[i]["total"], reverse=True)
+
+            for rank, orig_idx in enumerate(ranked_indices):
+                reward_val = rewards[orig_idx]["total"]
+                suffix = "_BEST" if orig_idx == best_idx else ""
+                filename = f"candidate_{rank+1:02d}_r{reward_val:.4f}{suffix}.mp4"
+                _save_fn(candidates[orig_idx], str(case_dir / filename))
 
             results = {
                 "prompt": prompt,
@@ -363,7 +369,9 @@ def main():
                 "best_reward": rewards[best_idx],
                 "total_time_sec": elapsed,
                 "candidates": [
-                    {"idx": i, "reward": r} for i, r in enumerate(rewards)
+                    {"rank": rank + 1, "original_idx": i, "reward": rewards[i],
+                     "is_best": i == best_idx}
+                    for rank, i in enumerate(ranked_indices)
                 ],
             }
             with (case_dir / "rewards.json").open("w", encoding="utf-8") as f:
