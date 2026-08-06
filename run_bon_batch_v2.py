@@ -25,7 +25,7 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "Wan2.2"))
-sys.path.insert(0, str(ROOT / "4RC-main"))
+sys.path.insert(0, str(ROOT / "4RC-main" / "4RC-main"))
 
 import wan
 from wan.configs import MAX_AREA_CONFIGS, WAN_CONFIGS

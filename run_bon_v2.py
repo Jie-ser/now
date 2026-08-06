@@ -28,7 +28,7 @@ import torch
 from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Wan2.2"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "4RC-main"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "4RC-main", "4RC-main"))
 
 import wan
 from wan.configs import WAN_CONFIGS, MAX_AREA_CONFIGS
