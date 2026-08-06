@@ -179,7 +179,7 @@ def build_recon_config(args):
 
 def load_4rc_model(model_path, device="cuda"):
     """Load 4RC (Arc) model from checkpoint path."""
-    from arc.arc import Arc
+    from arc.models.arc.arc import Arc
 
     logger.info(f"Loading 4RC model from: {model_path}")
     model = Arc.from_pretrained(model_path)
