@@ -353,7 +353,7 @@ class ReconstructionReward:
         # Camera translation acceleration
         cam_positions = extrinsics[:, :3, 3]  # (N, 3)
         if N >= 3:
-            cam_accel = cam_positions[2:] - 2 * cam_positions[1:-1] + cam_positions[:-1]
+            cam_accel = cam_positions[2:] - 2 * cam_positions[1:-1] + cam_positions[:-2]
             E_cam_accel = torch.norm(cam_accel, dim=-1).median() / scene_scale
         else:
             E_cam_accel = torch.tensor(0.0, device=device)
