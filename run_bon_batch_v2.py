@@ -340,8 +340,6 @@ def main():
                 if offload_models:
                     fourrc_model.cpu()
                     torch.cuda.empty_cache()
-                    wan_i2v.low_noise_model.cuda()
-                    wan_i2v.high_noise_model.cuda()
 
                 logger.info(f"  Candidate {i+1}/{args.N} (seed={seed}): "
                             f"total={r['total']:.4f}")
