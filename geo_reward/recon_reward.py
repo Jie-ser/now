@@ -313,7 +313,7 @@ class ReconstructionReward:
         trajectories = track[:, selected[:, 0], selected[:, 1], :]  # (N, K, 3)
 
         # Acceleration (second-order finite difference)
-        accel = trajectories[2:] - 2 * trajectories[1:-1] + trajectories[:-1]
+        accel = trajectories[2:] - 2 * trajectories[1:-1] + trajectories[:-2]
         accel_magnitude = torch.norm(accel, dim=-1) / scene_scale  # (N-2, K)
         E_accel = accel_magnitude.median()
 
