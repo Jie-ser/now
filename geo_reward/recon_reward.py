@@ -487,7 +487,7 @@ class ReconstructionReward:
         indices = all_valid.nonzero()[:K]
         traj = track[:, indices[:, 0], indices[:, 1], :]  # (N, K, 3)
 
-        accel = traj[2:] - 2 * traj[1:-1] + traj[:-1]
+        accel = traj[2:] - 2 * traj[1:-1] + traj[:-2]
         return (torch.norm(accel, dim=-1) / scene_scale).mean()
 
     def _differentiable_anchor_loss(self, pts, static_mask, extrinsic_frame0=None):
