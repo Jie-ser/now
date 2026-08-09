@@ -781,13 +781,19 @@ class GeoRewardBoNProgressiveV2(GeoRewardBoNProgressive):
     def _offload_vae(self):
         """Move VAE to CPU to free GPU memory for 4RC."""
         if hasattr(self.wan, 'vae') and self.wan.vae is not None:
-            self.wan.vae.cpu()
+            if hasattr(self.wan.vae, 'model'):
+                self.wan.vae.model.cpu()
+            else:
+                self.wan.vae.cpu()
             torch.cuda.empty_cache()
 
     def _load_vae(self):
         """Move VAE back to GPU for decoding."""
         if hasattr(self.wan, 'vae') and self.wan.vae is not None:
-            self.wan.vae.cuda()
+            if hasattr(self.wan.vae, 'model'):
+                self.wan.vae.model.cuda()
+            else:
+                self.wan.vae.cuda()
 
     def _offload_4rc(self):
         """Move 4RC model to CPU."""
