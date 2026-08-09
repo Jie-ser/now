@@ -7,14 +7,14 @@
 ```
 now/
 ├── geo_reward/                  # 核心模块
-│   ├── __init__.py              # 导出 DA3GeoReward, GeometryRewardConfig, ReconstructionReward, ReconRewardConfig, GeoRewardBoN, GeoRewardBoNProgressive, GeoRewardBoNProgressiveV2, GeometricGuidance
+│   ├── __init__.py              # 导出 DA3GeoReward, GeometryRewardConfig, ReconstructionReward, ReconRewardConfig, GeoRewardBoN, GeoRewardBoNProgressive, GeoRewardBoNProgressiveV2, GeoRewardBoNTreeBranching, GeometricGuidance
 │   ├── da3_reward.py            # DA3GeoReward 主类 + GeometryRewardConfig + compute_reward_early（V1 保留）
 │   ├── recon_reward.py          # 【V2 新增】ReconstructionReward + ReconRewardConfig（4RC 显式几何一致性）
 │   ├── fourrc_adapter.py        # 【V2 新增】4RC 接口适配（PIL→view、valid_mask、dynamic_mask）
 │   ├── guidance.py              # 【V2 新增】梯度引导模块（Phase 3，GeometricGuidance）
 │   ├── region_masks.py          # 静态/动态区域分割（帧差+深度变化率+OR组合）（V1 保留）
 │   ├── motion_reward.py         # 运动质量评分（motion_gate + R_shape + R_smoothness）（V1 保留）
-│   ├── bon_pipeline.py          # GeoRewardBoN / GeoRewardBoNProgressive（V1）/ GeoRewardBoNProgressiveV2（V2+模型交替加载）/ GeoRewardBoNOffline
+│   ├── bon_pipeline.py          # GeoRewardBoN / GeoRewardBoNProgressive（V1）/ GeoRewardBoNProgressiveV2（V2+模型交替加载）/ GeoRewardBoNTreeBranching（Tree Branching 加速）/ GeoRewardBoNOffline
 │   └── utils.py                 # 格式转换（wan→PIL）、均匀抽帧、坐标变换
 ├── run_bon.py                   # 单条 BoN CLI（--mode bon / score）
 ├── run_bon_batch.py             # 批量 BoN CLI（--start/--end，模型只加载一次）
@@ -197,13 +197,70 @@ DEFAULT_SCORE_EPSILON = 0.02               # 分数不可区分阈值
 DEFAULT_EARLY_MAX_FRAMES = 12              # 早期 DA3 采帧数
 ```
 
+## Tree Branching BoN 加速
+
+### 核心思想
+
+将渐进淘汰 BoN 的前半段从「8 条独立轨迹」改为「K 条共享主干 + 分叉扩展」，利用高噪声阶段的结构趋同性共享计算。相比渐进淘汰再省 ~29% DiT 步数。
+
+### 流程（shift=5.0, branch_sigma=0.90）
+
+```
+Step 0 → 16:   K=2 条主干轨迹并行去噪          [2×16 = 32 步]
+Step 16:        每条主干分叉为 4 条 → 共 8 条    [分叉点]
+Step 16 → 22:  8 条候选独立去噪                 [8×6 = 48 步]
+Step 22:        评分，淘汰 50% → 4 条           [Early Checkpoint]
+Step 22 → 31:  4 条候选去噪                     [4×9 = 36 步]
+Step 31:        评分，淘汰 50% → 2 条           [Mid Checkpoint]
+Step 31 → 40:  2 条候选去噪                     [2×9 = 18 步]
+Step 40:        最终评分，选出 best              [Final]
+总计：32 + 48 + 36 + 18 = 134 步（vs 渐进 190 步，朴素 320 步）
+```
+
+### 分叉噪声注入公式
+
+```python
+z_branch = sqrt(1 - η²) * z_trunk + η * σ_t * ε,    ε ~ N(0, I)
+```
+
+- 方差保持：扰动后 latent 仍在正确噪声水平 manifold 上
+- σ_t 缩放：扰动大小与当前噪声水平成正比
+- 理论保证：Kim et al. (2025) ODE-to-SDE 边缘分布一致性
+
+### σ-based 分叉点（动态映射步数）
+
+通过 `find_step_for_sigma(state, branch_sigma)` 动态确定分叉步，适应不同 shift/步数。
+
+### 默认参数
+
+```python
+DEFAULT_NUM_TRUNKS = 2              # 主干数量
+DEFAULT_BRANCHES_PER_TRUNK = 4      # 每主干分叉数（总候选 N=8）
+DEFAULT_BRANCH_SIGMA = 0.90         # 分叉点 σ（动态映射步数）
+DEFAULT_BRANCH_ETA = 0.10           # 多样性超参数 η
+```
+
+### 约束
+
+- `branch_sigma` 必须 > `max(sigma_checkpoints)`，否则分叉后无法正常渐进淘汰
+- η 推荐 0.05~0.15；> 0.20 可能偏离训练分布产生 artifacts
+- `branch_sigma` 建议 ≤ 0.93，否则分叉后仍有 high_noise_model 步（增加模型搬运开销）
+
+### 计算量对比
+
+| 方案 | DiT 步数 | VAE 解码 | Reward 推理 |
+|------|----------|----------|-------------|
+| 朴素 BoN (N=8) | 320 | 8 | 8 |
+| 渐进淘汰 V2 | 190 | 14 | 14 |
+| **Tree Branching** | **134** | **14** | **14** |
+
 ## 远程服务器路径
 
 ```
 项目目录:  /pfs/mayuema/spj/now
 Wan2.2 权重: /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B
 DA3 模型:   /pfs/mayuema/spj/DA3/models/DA3NESTED-GIANT-LARGE-1.1
-4RC 模型:   /pfs/mayuema/spj/4RC/models/4RC  (待确认具体路径)
+4RC 模型:   /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC
 输入图片:   /pfs/mayuema/spj/now/inputs/<子目录>/
 ```
 
@@ -257,6 +314,147 @@ python score_video.py --video path/to/video.mp4 \
   --tau_shape 0.10 --tau_smooth 2.0 \
   --min_motion_threshold 0.01 \
   --image_diff_threshold 15.0
+
+# ===== V2（4RC）运行命令 =====
+
+# V2 Best-of-N 渐进淘汰（单条，默认）
+python run_bon_v2.py \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --image /path/to/first_frame.png \
+  --prompt "动作指令" \
+  --N 8 --size 480*832 --sample_shift 3.0 --t5_cpu
+
+# V2 禁用渐进淘汰（顺序 BoN，8 个全部跑完）
+python run_bon_v2.py --no_progressive \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --image /path/to/first_frame.png \
+  --prompt "动作指令" \
+  --N 8 --size 480*832 --sample_shift 3.0 --t5_cpu
+
+# V2 批量 BoN（渐进淘汰）
+python run_bon_batch_v2.py \
+  --start 1 --end 10 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json \
+  --name_prefix test_real \
+  --t5_cpu --sample_shift 3.0
+
+# V2 批量 BoN（禁用渐进，全量生成 + 评分）
+python run_bon_batch_v2.py \
+  --start 1 --end 24 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json \
+  --name_prefix test_real \
+  --no_progressive \
+  --N 8 --t5_cpu --sample_shift 3.0
+
+# V2 自定义淘汰参数 + reward 参数
+python run_bon_batch_v2.py \
+  --start 1 --end 10 \
+  --sigma_checkpoints 0.83 0.63 \
+  --elimination_ratio 0.5 \
+  --min_survivors 2 \
+  --score_epsilon 0.02 \
+  --early_max_frames 12 \
+  --static_weight 0.40 --dynamic_weight 0.40 --motion_weight 0.20 \
+  --tau_reproj 0.10 --tau_accel 0.05 --tau_speed 3.0 \
+  --tau_cam 0.02 --tau_rot 0.05 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json \
+  --name_prefix test_real \
+  --t5_cpu --sample_shift 3.0
+
+# V2 独立视频评分
+python score_video_v2.py \
+  --video path/to/video.mp4 \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC
+
+python score_video_v2.py \
+  --video path/to/video.pt \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --output_dir results/
+
+# V2 Reward 参数可通过 CLI 调整，例如：
+python score_video_v2.py --video path/to/video.mp4 \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --static_weight 0.40 --dynamic_weight 0.40 --motion_weight 0.20 \
+  --tau_reproj 0.10 --tau_accel 0.05 \
+  --dynamic_threshold_ratio 0.01 \
+  --conf_valid_quantile 0.20
+
+# V2 多卡并行批量（示例：3 卡各跑 24 个）
+CUDA_VISIBLE_DEVICES=1 python run_bon_batch_v2.py --start 1 --end 24 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json --name_prefix test_real \
+  --no_progressive --N 8 --t5_cpu --sample_shift 3.0
+
+CUDA_VISIBLE_DEVICES=2 python run_bon_batch_v2.py --start 25 --end 48 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json --name_prefix test_real \
+  --no_progressive --N 8 --t5_cpu --sample_shift 3.0
+
+CUDA_VISIBLE_DEVICES=3 python run_bon_batch_v2.py --start 49 --end 72 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json --name_prefix test_real \
+  --no_progressive --N 8 --t5_cpu --sample_shift 3.0
+
+# ===== Tree Branching 加速 =====
+
+# V2 Tree Branching（单条，推荐配置）
+python run_bon_v2.py \
+  --tree_branching \
+  --num_trunks 2 --branches_per_trunk 4 \
+  --branch_sigma 0.90 --branch_eta 0.10 \
+  --sigma_checkpoints 0.83 0.63 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --image /path/to/first_frame.png \
+  --prompt "动作指令" \
+  --size 480*832 --sample_shift 5.0 --t5_cpu
+
+# V2 Tree Branching（批量）
+python run_bon_batch_v2.py \
+  --start 1 --end 24 \
+  --tree_branching \
+  --num_trunks 2 --branches_per_trunk 4 \
+  --branch_sigma 0.90 --branch_eta 0.10 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json \
+  --name_prefix test_tree \
+  --t5_cpu --sample_shift 5.0
+
+# V2 Tree Branching 多卡并行
+CUDA_VISIBLE_DEVICES=1 python run_bon_batch_v2.py --start 1 --end 24 \
+  --tree_branching --branch_sigma 0.90 --branch_eta 0.10 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json --name_prefix test_tree \
+  --t5_cpu --sample_shift 5.0
+
+CUDA_VISIBLE_DEVICES=2 python run_bon_batch_v2.py --start 25 --end 48 \
+  --tree_branching --branch_sigma 0.90 --branch_eta 0.10 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json --name_prefix test_tree \
+  --t5_cpu --sample_shift 5.0
 ```
 
 ## 关键技术细节
@@ -270,6 +468,9 @@ python score_video.py --video path/to/video.mp4 \
 - 场景尺度归一化：首帧静态区域深度中位数
 - 渐进淘汰通过 `wan.prepare_progressive()` 共享文本 embedding 和噪声初始化
 - 中间 checkpoint 通过 `extract_pred_x0()` 提取预测清晰 latent，不中断去噪
+- Tree Branching 通过 `wan.branch_candidates()` 在分叉点用 ODE-to-SDE 噪声注入创建分支
+- 分叉点由 `find_step_for_sigma(state, branch_sigma)` 动态确定（σ-based，适应不同 shift）
+- Scheduler 深拷贝保留 UniPC/DPM++ 内部状态（model_outputs, step_index 等）
 
 ## GeometryRewardConfig 默认值
 
@@ -300,6 +501,9 @@ total_motion_weight = 0.70     # R_motion 在总分中的权重
   - Phase 1：完整 BoN（4RC reward 选优 vs random vs V1）
   - Phase 2：Progressive BoN（验证 early score 与 final score 相关性）
   - Phase 3：梯度引导 + BoN（GeometricGuidance 模块已就绪，待 Phase 1/2 验证）
+- **Tree Branching**（代码已完成）：共享主干 + 分叉加速（GeoRewardBoNTreeBranching）
+  - 相比渐进淘汰再省 ~29% DiT 步数（134 vs 190）
+  - 待验证：η=0 退化测试、不同 η 多样性对比、加速比实测、质量对比
 - **Part 2**（更后续）：梯度引导去噪 + BoN 组合 + 下游机械臂任务验证
 
 ## 代码规范

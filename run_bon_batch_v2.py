@@ -30,7 +30,7 @@ sys.path.insert(0, str(ROOT / "4RC-main" / "4RC-main"))
 import wan
 from wan.configs import MAX_AREA_CONFIGS, WAN_CONFIGS
 from wan.utils.utils import save_video
-from geo_reward import ReconstructionReward, ReconRewardConfig, GeoRewardBoNProgressiveV2
+from geo_reward import ReconstructionReward, ReconRewardConfig, GeoRewardBoNProgressiveV2, GeoRewardBoNTreeBranching
 
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,22 @@ def parse_args():
                         help="Score indistinguishability threshold.")
     parser.add_argument("--early_max_frames", type=int, default=12,
                         help="Frames to sample at early checkpoint.")
+
+    # Intermediate video saving
+    parser.add_argument("--save_intermediate", action="store_true",
+                        help="Save intermediate checkpoint videos (default: off, only save best).")
+
+    # Tree Branching
+    parser.add_argument("--tree_branching", action="store_true",
+                        help="Enable Tree Branching acceleration (shared trunk + branch).")
+    parser.add_argument("--num_trunks", type=int, default=2,
+                        help="Number of trunk trajectories (default: 2).")
+    parser.add_argument("--branches_per_trunk", type=int, default=4,
+                        help="Branches per trunk (total N = num_trunks * branches_per_trunk).")
+    parser.add_argument("--branch_sigma", type=float, default=0.90,
+                        help="Target σ for branch point (default: 0.90).")
+    parser.add_argument("--branch_eta", type=float, default=0.10,
+                        help="Branch diversity hyperparameter η (default: 0.10).")
 
     # V2 reward weights
     parser.add_argument("--static_weight", type=float, default=0.40,
@@ -220,7 +236,28 @@ def main():
 
     use_progressive = not args.no_progressive
 
-    if use_progressive:
+    if args.tree_branching:
+        N = args.num_trunks * args.branches_per_trunk
+        bon = GeoRewardBoNTreeBranching(
+            wan_i2v=wan_i2v,
+            recon_reward=recon_reward,
+            num_trunks=args.num_trunks,
+            branches_per_trunk=args.branches_per_trunk,
+            branch_sigma=args.branch_sigma,
+            branch_eta=args.branch_eta,
+            max_frames=args.max_frames,
+            sigma_checkpoints=args.sigma_checkpoints,
+            elimination_ratio=args.elimination_ratio,
+            min_survivors=args.min_survivors,
+            score_epsilon=args.score_epsilon,
+            early_max_frames=args.early_max_frames,
+            offload_models=offload_models,
+        )
+        logger.info(f"Mode: Tree Branching BoN V2 (trunks={args.num_trunks}, "
+                    f"branches={args.branches_per_trunk}, N={N}, "
+                    f"branch_sigma={args.branch_sigma}, eta={args.branch_eta})")
+    elif use_progressive:
+        N = args.N
         bon = GeoRewardBoNProgressiveV2(
             wan_i2v=wan_i2v,
             recon_reward=recon_reward,
@@ -257,14 +294,15 @@ def main():
 
         t0 = time.time()
 
-        if use_progressive:
+        if args.tree_branching or use_progressive:
+            gen_N = N if args.tree_branching else args.N
             best_video, result_log, best_seed = bon.generate(
                 prompt=prompt,
                 image=Image.open(image_path).convert("RGB"),
-                N=args.N,
+                N=gen_N,
                 frame_num=args.frame_num,
                 seed_base=None,
-                output_dir=str(case_dir),
+                output_dir=str(case_dir) if args.save_intermediate else None,
                 save_fn=_save_fn,
                 max_area=MAX_AREA_CONFIGS[args.size],
                 shift=args.sample_shift,

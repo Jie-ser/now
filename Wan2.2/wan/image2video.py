@@ -690,6 +690,58 @@ class WanI2V:
                 break
         return best_step
 
+    def branch_candidates(self, state, trunk_indices, branches_per_trunk, eta, branch_seeds):
+        """
+        From K trunk trajectories, create K * branches_per_trunk branched candidates.
+
+        Args:
+            state: dict returned by prepare_progressive()
+            trunk_indices: List[int], indices of trunk candidates (e.g. [0, 1])
+            branches_per_trunk: int, branches per trunk (e.g. 4)
+            eta: float, diversity hyperparameter
+            branch_seeds: List[int], one seed per branch (len = K * branches_per_trunk)
+
+        Returns:
+            Updated state with candidates list replaced by branched candidates.
+        """
+        import copy
+
+        if not (0.0 <= eta <= 1.0):
+            raise ValueError(f"eta must be in [0, 1], got {eta}")
+
+        new_candidates = []
+        branch_idx = 0
+
+        for trunk_idx in trunk_indices:
+            trunk_cand = state['candidates'][trunk_idx]
+            z_trunk = trunk_cand['latent'].clone()
+
+            step_idx = trunk_cand['scheduler'].step_index
+            sigma_t = float(trunk_cand['scheduler'].sigmas[step_idx])
+
+            for b in range(branches_per_trunk):
+                seed = branch_seeds[branch_idx]
+                generator = torch.Generator(device=z_trunk.device).manual_seed(seed)
+                epsilon = torch.randn(z_trunk.shape, generator=generator,
+                                      device=z_trunk.device, dtype=z_trunk.dtype)
+
+                z_branch = math.sqrt(1 - eta**2) * z_trunk + eta * sigma_t * epsilon
+
+                new_scheduler = copy.deepcopy(trunk_cand['scheduler'])
+
+                new_candidates.append({
+                    'latent': z_branch,
+                    'scheduler': new_scheduler,
+                    'generator': generator,
+                    'seed': seed,
+                    'step_index': step_idx,
+                    'parent_trunk': trunk_idx,
+                })
+                branch_idx += 1
+
+        state['candidates'] = new_candidates
+        return state
+
     def cleanup_progressive(self, state, offload_model=True):
         """Release references held by the progressive state."""
         if state is None:

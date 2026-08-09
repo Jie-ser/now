@@ -34,7 +34,7 @@ import wan
 from wan.configs import WAN_CONFIGS, MAX_AREA_CONFIGS
 from wan.utils.utils import save_video
 
-from geo_reward import ReconstructionReward, ReconRewardConfig, GeoRewardBoNProgressiveV2
+from geo_reward import ReconstructionReward, ReconRewardConfig, GeoRewardBoNProgressiveV2, GeoRewardBoNTreeBranching
 from geo_reward.utils import wan_output_to_pil, sample_frames
 
 
@@ -92,6 +92,22 @@ def parse_args():
                         help="Score indistinguishability threshold.")
     parser.add_argument("--early_max_frames", type=int, default=12,
                         help="Frames to sample at early checkpoint.")
+
+    # Intermediate video saving
+    parser.add_argument("--save_intermediate", action="store_true",
+                        help="Save intermediate checkpoint videos (default: off, only save best).")
+
+    # Tree Branching args
+    parser.add_argument("--tree_branching", action="store_true",
+                        help="Enable Tree Branching acceleration (shared trunk + branch).")
+    parser.add_argument("--num_trunks", type=int, default=2,
+                        help="Number of trunk trajectories (default: 2).")
+    parser.add_argument("--branches_per_trunk", type=int, default=4,
+                        help="Branches per trunk (total N = num_trunks * branches_per_trunk).")
+    parser.add_argument("--branch_sigma", type=float, default=0.90,
+                        help="Target σ for branch point (default: 0.90, maps to step dynamically).")
+    parser.add_argument("--branch_eta", type=float, default=0.10,
+                        help="Branch diversity hyperparameter η (default: 0.10).")
 
     # 4RC model args
     parser.add_argument("--fourrc_model", type=str, required=True,
@@ -223,7 +239,98 @@ def run_bon(args):
     use_progressive = not args.no_progressive
     offload_models = not args.no_model_offload
 
-    if use_progressive:
+    if args.tree_branching:
+        N = args.num_trunks * args.branches_per_trunk
+        logger.info(f"Mode: Tree Branching BoN V2 "
+                    f"(trunks={args.num_trunks}, branches={args.branches_per_trunk}, "
+                    f"N={N}, branch_sigma={args.branch_sigma}, eta={args.branch_eta}, "
+                    f"σ checkpoints: {args.sigma_checkpoints}, offload: {offload_models})")
+
+        bon = GeoRewardBoNTreeBranching(
+            wan_i2v=wan_i2v,
+            recon_reward=recon_reward,
+            num_trunks=args.num_trunks,
+            branches_per_trunk=args.branches_per_trunk,
+            branch_sigma=args.branch_sigma,
+            branch_eta=args.branch_eta,
+            max_frames=args.max_frames,
+            sigma_checkpoints=args.sigma_checkpoints,
+            elimination_ratio=args.elimination_ratio,
+            min_survivors=args.min_survivors,
+            score_epsilon=args.score_epsilon,
+            early_max_frames=args.early_max_frames,
+            offload_models=offload_models,
+        )
+
+        def _save_fn(tensor, path):
+            save_video(
+                tensor=tensor[None],
+                save_file=path,
+                fps=wan_cfg.sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1),
+            )
+
+        t0 = time.time()
+        best_video, result_log, best_seed = bon.generate(
+            prompt=args.prompt,
+            image=img,
+            N=N,
+            frame_num=args.frame_num,
+            seed_base=args.seed_base,
+            output_dir=case_dir if args.save_intermediate else None,
+            save_fn=_save_fn,
+            max_area=MAX_AREA_CONFIGS[args.size],
+            shift=args.sample_shift,
+            sample_solver=args.sample_solver,
+            sampling_steps=args.sampling_steps,
+            guide_scale=args.guide_scale,
+            offload_model=args.offload_model,
+        )
+        total_time = time.time() - t0
+
+        if best_video is not None:
+            best_path = os.path.join(case_dir, f"seed_{best_seed}_BEST.mp4")
+            _save_fn(best_video, best_path)
+
+        result_log["prompt"] = args.prompt
+        result_log["image"] = os.path.abspath(args.image)
+        result_log["total_time_sec"] = total_time
+        result_log["config"] = {
+            "reward_version": "v2_4rc",
+            "tree_branching": True,
+            "num_trunks": args.num_trunks,
+            "branches_per_trunk": args.branches_per_trunk,
+            "branch_sigma": args.branch_sigma,
+            "branch_eta": args.branch_eta,
+            "sigma_checkpoints": args.sigma_checkpoints,
+            "elimination_ratio": args.elimination_ratio,
+            "min_survivors": args.min_survivors,
+            "score_epsilon": args.score_epsilon,
+            "early_max_frames": args.early_max_frames,
+            "fourrc_model": args.fourrc_model,
+            "image_size": args.image_size,
+            "max_frames": args.max_frames,
+            "offload_models": offload_models,
+            "static_weight": args.static_weight,
+            "dynamic_weight": args.dynamic_weight,
+            "motion_weight": args.motion_weight,
+            "size": args.size,
+            "frame_num": args.frame_num,
+            "sampling_steps": args.sampling_steps,
+            "guide_scale": args.guide_scale,
+            "seed_base": args.seed_base,
+        }
+
+        log_path = os.path.join(case_dir, "rewards.json")
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(result_log, f, indent=2, ensure_ascii=False)
+        logger.info(f"Results saved to: {case_dir}")
+
+        return best_video, result_log
+
+    elif use_progressive:
         logger.info(f"Mode: Progressive Elimination BoN V2 "
                     f"(σ checkpoints: {args.sigma_checkpoints}, "
                     f"elimination_ratio: {args.elimination_ratio}, "
@@ -258,7 +365,7 @@ def run_bon(args):
             N=args.N,
             frame_num=args.frame_num,
             seed_base=args.seed_base,
-            output_dir=case_dir,
+            output_dir=case_dir if args.save_intermediate else None,
             save_fn=_save_fn,
             max_area=MAX_AREA_CONFIGS[args.size],
             shift=args.sample_shift,
