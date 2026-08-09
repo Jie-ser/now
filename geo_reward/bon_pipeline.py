@@ -772,11 +772,14 @@ class GeoRewardBoNProgressiveV2(GeoRewardBoNProgressive):
         torch.cuda.empty_cache()
 
     def _load_dit(self):
-        """Move DiT model back to GPU for denoising."""
-        if hasattr(self.wan, 'low_noise_model') and self.wan.low_noise_model is not None:
-            self.wan.low_noise_model.cuda()
-        if hasattr(self.wan, 'high_noise_model') and self.wan.high_noise_model is not None:
-            self.wan.high_noise_model.cuda()
+        """Ensure DiT is ready for denoising.
+
+        When offload_model=True, denoise_candidates() loads the correct model
+        (high/low noise) on demand per step. Pre-loading both here would OOM.
+        We only need to make sure they're not stuck on a wrong device — but
+        since denoise_candidates handles this, this is intentionally a no-op.
+        """
+        pass
 
     def _offload_vae(self):
         """Move VAE to CPU to free GPU memory for 4RC."""
