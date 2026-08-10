@@ -739,7 +739,7 @@ class GeoRewardBoNProgressiveV2(GeoRewardBoNProgressive):
                 self._offload_4rc()
                 if not is_final:
                     self._load_dit()
-                    self._load_vae()
+                self._load_vae()
 
             if is_final:
                 break
@@ -1075,7 +1075,7 @@ class GeoRewardBoNTreeBranching(GeoRewardBoNProgressiveV2):
                 self._offload_4rc()
                 if not is_final:
                     self._load_dit()
-                    self._load_vae()
+                self._load_vae()
 
             # 6. Eliminate
             if not is_final:
