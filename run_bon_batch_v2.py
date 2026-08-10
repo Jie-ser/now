@@ -421,6 +421,10 @@ def main():
 
                     def _g_reload():
                         fourrc_model.cpu()
+                        if hasattr(wan_i2v.vae, 'model'):
+                            wan_i2v.vae.model.cpu()
+                        else:
+                            wan_i2v.vae.cpu()
                         torch.cuda.empty_cache()
                         dev = wan_i2v.device
                         if next(wan_i2v.low_noise_model.parameters()).device.type != dev.type:

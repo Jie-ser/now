@@ -1058,7 +1058,7 @@ class GeoRewardBoNProgressiveV2Guided(GeoRewardBoNProgressiveV2):
                 self.wan.vae.cuda()
 
     def _guidance_reload_dit(self):
-        """Reload DiT after guidance step, offload 4RC.
+        """Reload DiT after guidance step, offload 4RC + VAE.
 
         Explicitly moves DiT models back to GPU to handle the case where
         offload_model=False and init_on_cpu=False — in that scenario
@@ -1066,6 +1066,12 @@ class GeoRewardBoNProgressiveV2Guided(GeoRewardBoNProgressiveV2):
         """
         if self.guidance.model_4rc is not None:
             self.guidance.model_4rc.cpu()
+        # Also offload VAE (was loaded to GPU for decode_differentiable)
+        if hasattr(self.wan, 'vae') and self.wan.vae is not None:
+            if hasattr(self.wan.vae, 'model'):
+                self.wan.vae.model.cpu()
+            else:
+                self.wan.vae.cpu()
         torch.cuda.empty_cache()
         # Explicitly reload both DiT models to GPU.
         # _prepare_model_for_timestep will offload the unneeded one if offload_model=True,

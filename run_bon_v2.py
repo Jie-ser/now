@@ -513,6 +513,10 @@ def run_bon(args):
 
                 def _guidance_reload():
                     fourrc_model.cpu()
+                    if hasattr(wan_i2v.vae, 'model'):
+                        wan_i2v.vae.model.cpu()
+                    else:
+                        wan_i2v.vae.cpu()
                     torch.cuda.empty_cache()
                     device = wan_i2v.device
                     if next(wan_i2v.low_noise_model.parameters()).device.type != device.type:
