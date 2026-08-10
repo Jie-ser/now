@@ -65,7 +65,7 @@ class ReconRewardConfig:
     guidance_scale: float = 0.001
     guidance_frequency: int = 5
     sigma_min: float = 0.08
-    sigma_max: float = 0.45
+    sigma_max: float = 0.90
 
 
 class ReconstructionReward:

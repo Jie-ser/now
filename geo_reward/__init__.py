@@ -5,6 +5,7 @@ from .bon_pipeline import (
     GeoRewardBoNOffline,
     GeoRewardBoNProgressive,
     GeoRewardBoNProgressiveV2,
+    GeoRewardBoNProgressiveV2Guided,
     GeoRewardBoNTreeBranching,
 )
 from .guidance import GeometricGuidance

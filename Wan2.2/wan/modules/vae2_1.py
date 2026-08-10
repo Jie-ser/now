@@ -661,3 +661,22 @@ class Wan2_1_VAE:
                                   self.scale).float().clamp_(-1, 1).squeeze(0)
                 for u in zs
             ]
+
+    def decode_differentiable(self, z):
+        """
+        Differentiable VAE decode for gradient guidance.
+
+        Unlike decode(), this does NOT use torch.no_grad() and preserves
+        gradient flow from input latent through to output video tensor.
+        The VAE parameters remain frozen (requires_grad=False) but the
+        input tensor's gradient is tracked.
+
+        Args:
+            z: Single latent tensor (C, T, H, W) with requires_grad=True.
+
+        Returns:
+            Video tensor (3, T_out, H_out, W_out) in [-1, 1], gradient-connected to z.
+        """
+        with torch.enable_grad(), amp.autocast(dtype=self.dtype):
+            out = self.model.decode(z.unsqueeze(0), self.scale)
+            return out.float().clamp(-1, 1).squeeze(0)

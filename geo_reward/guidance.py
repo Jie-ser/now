@@ -5,21 +5,21 @@ Applies differentiable geometric loss as guidance during the Wan2.2 denoising
 process. The gradient target is explicit geometric consistency — NOT confidence.
 
 Architecture:
-  1. Extract pred_x0 at each guidance step
-  2. VAE decode (differentiable path)
-  3. 4RC forward (no @torch.no_grad wrapper)
-  4. Compute geometric loss (conf detached as valid mask only)
-  5. Backpropagate through latent → modify v_pred
+  1. At selected denoising steps, compute pred_x0 from (latent, v_pred, sigma_t)
+  2. VAE decode_differentiable(pred_x0) → video frames (gradient flows)
+  3. 4RC forward on sampled frames (no @torch.no_grad wrapper)
+  4. Compute geometric loss (L_reproj + L_track_smoothness + L_anchor)
+     conf is detached as valid mask only — never backprop through confidence
+  5. Backpropagate loss → grad w.r.t. pred_x0
+  6. Apply WMReward-style normalization to modify v_pred
 
-KNOWN LIMITATIONS (must be resolved before activation):
-  - Requires a custom `vae.decode_differentiable()` method that does NOT wrap
-    in torch.no_grad(). Wan2.2's standard decode uses no_grad and returns a list,
-    which breaks both gradient flow and the expected (B,C,T,H,W) tensor interface.
-  - Not yet integrated into GeoRewardBoNProgressiveV2 or Wan's denoising loop.
-  - This module is a standalone framework awaiting Phase 1/2 validation.
+Integration:
+  Called from denoise_candidates_with_guidance() in WanI2V, which invokes
+  guidance.guided_v_pred() after computing noise_pred but before scheduler.step().
 
-Note: This module requires Phase 1/2 validation to confirm reward signal
-effectiveness before activation.
+Memory management:
+  Guidance requires 4RC + VAE on GPU simultaneously for the backward pass.
+  The pipeline handles offloading DiT before guidance steps and reloading after.
 """
 
 import warnings
@@ -39,204 +39,171 @@ class GeometricGuidance:
     geometrically consistent video generation.
     """
 
-    def __init__(self, model_4rc, vae=None, cfg=None, recon_reward=None):
+    def __init__(self, model_4rc, vae, cfg=None, guidance_frames=8):
         """
         Args:
             model_4rc: 4RC (Arc) model, must allow gradient flow.
-            vae: Wan2.2 VAE decoder (must support differentiable decode).
+            vae: Wan2.2 VAE (Wan2_1_VAE instance with decode_differentiable).
             cfg: ReconRewardConfig with guidance parameters.
-            recon_reward: ReconstructionReward instance for computing
-                          the full differentiable loss. If None, one is
-                          created internally with the given cfg.
+            guidance_frames: Number of frames to sample for guidance (fewer = faster).
         """
         self.model_4rc = model_4rc
         self.vae = vae
         self.cfg = cfg or ReconRewardConfig()
-        self.recon_reward = recon_reward or ReconstructionReward(
-            model=model_4rc, cfg=self.cfg
-        )
-        self.step_count = 0
+        self.guidance_frames = guidance_frames
+        self.recon_reward = ReconstructionReward(model=model_4rc, cfg=self.cfg)
 
-    def should_guide(self, sigma_t):
+    def should_guide(self, sigma_t, step_idx):
         """Check whether guidance should be applied at this noise level and step."""
+        if self.cfg.guidance_frequency <= 0:
+            return False
         if not (self.cfg.sigma_min < sigma_t < self.cfg.sigma_max):
             return False
-        if self.step_count % self.cfg.guidance_frequency != 0:
+        if step_idx % self.cfg.guidance_frequency != 0:
             return False
         return True
 
-    def guided_denoise_step(self, latent, v_pred, sigma_t, step_idx):
+    def guided_v_pred(self, latent, v_pred, sigma_t, step_idx):
         """
-        Apply geometric guidance to v_pred if conditions are met.
+        Apply geometric guidance to v_pred.
+
+        Called from the denoising loop after CFG but before scheduler.step().
 
         Args:
-            latent: Current noisy latent (B, C, T, H, W).
-            v_pred: Model's velocity prediction.
-            sigma_t: Current noise level.
+            latent: Current noisy latent (C, T, H, W) — single candidate.
+            v_pred: Model's velocity prediction (C, T, H, W).
+            sigma_t: Current noise level (scalar).
             step_idx: Current denoising step index.
 
         Returns:
-            Modified v_pred with geometric guidance gradient applied.
+            Modified v_pred with geometric guidance gradient applied,
+            or original v_pred if guidance conditions not met or gradient fails.
         """
-        self.step_count = step_idx
-
-        if not self.should_guide(sigma_t):
+        if not self.should_guide(sigma_t, step_idx):
             return v_pred
 
-        if self.vae is None or self.model_4rc is None:
-            return v_pred
-
+        # Compute pred_x0: x0 = x_t - sigma_t * v_pred (flow matching formula)
+        # Detach from the denoising graph — we build a fresh computational graph
+        # from x0_hat through VAE decode → 4RC → loss
         x0_hat = (latent - sigma_t * v_pred).detach().requires_grad_(True)
 
-        video = self._differentiable_decode(x0_hat)
-        if video is None:
-            return v_pred
-
-        frames = self._sample_fixed_frames(video, n=8)
-        views = self._prepare_views_differentiable(frames)
-
-        raw_output = self.model_4rc(views, force_no_output_conversion=True)
-
-        # Raw forward output keys (with force_no_output_conversion=True):
-        # "depth" (B,N,H,W), "depth_conf" (B,N,H,W),
-        # "track" (B,N,H,W,3), "conf_track" (B,N,H,W),
-        # "pose_enc" — raw camera encoding (NOT yet decoded to extrinsics/intrinsics)
-        # Note: "pts", "extrinsics_token", "intrinsics_token" do NOT exist —
-        # those are computed in _postprocess_output which we skipped.
-
-        # Decode pose_enc → extrinsics/intrinsics (differentiable)
-        from arc.models.arc.utils.transform import pose_encoding_to_extri_intri, affine_inverse
-        depth = raw_output["depth"]  # (B, N, H, W)
-        B_raw, N_raw, H_raw, W_raw = depth.shape
-        pose_enc = raw_output["pose_enc"]
-        c2w, ixt = pose_encoding_to_extri_intri(pose_enc, (H_raw, W_raw))
-        w2c = affine_inverse(c2w)  # (B, N, 4, 4) — world-to-camera
-
-        # Compute world points from depth + camera params (differentiable)
-        # Unproject: pixel (u,v) → camera ray → scale by depth → world coords
-        device = depth.device
-        u_grid, v_grid = torch.meshgrid(
-            torch.arange(W_raw, device=device, dtype=depth.dtype),
-            torch.arange(H_raw, device=device, dtype=depth.dtype),
-            indexing='xy',
-        )
-        ones = torch.ones_like(u_grid)
-        pixels = torch.stack([u_grid, v_grid, ones], dim=-1)  # (H, W, 3)
-
-        # For simplicity, use batch=0 only
-        depth_b = depth[0]  # (N, H, W)
-        w2c_b = w2c[0]      # (N, 4, 4)
-        ixt_b = ixt[0]      # (N, 3, 3)
-        track_raw = raw_output.get("track")
-        if track_raw is not None:
-            track_b = track_raw[0]  # (N, H, W, 3)
-        else:
-            track_b = None
-
-        # Unproject to world points per frame
-        pts_list = []
-        for t in range(N_raw):
-            K_inv = torch.linalg.inv(ixt_b[t])  # (3, 3)
-            rays = (K_inv @ pixels.reshape(-1, 3).T).T  # (H*W, 3)
-            pts_cam = rays * depth_b[t].reshape(-1, 1)  # (H*W, 3)
-            # cam → world: p_world = R^T @ (p_cam - t) for w2c = [R|t]
-            # Or: p_world = c2w @ [p_cam; 1]
-            c2w_t = torch.linalg.inv(w2c_b[t])  # (4, 4)
-            pts_homo = torch.cat([pts_cam, torch.ones_like(pts_cam[:, :1])], dim=-1)
-            pts_world = (c2w_t @ pts_homo.T).T[:, :3]  # (H*W, 3)
-            pts_list.append(pts_world.reshape(H_raw, W_raw, 3))
-
-        pts_tensor = torch.stack(pts_list)  # (N, H, W, 3)
-        ext_tensor = w2c_b  # (N, 4, 4) — but compute_differentiable_loss expects c2w
-        # Convert back to c2w for consistency with ReconstructionReward
-        c2w_tensor = c2w[0]  # (N, 4, 4)
-        int_tensor = ixt_b   # (N, 3, 3)
-
-        with torch.no_grad():
-            depth_conf = raw_output.get("depth_conf")
-            conf_track_raw = raw_output.get("conf_track")
-
-            if depth_conf is not None and depth_conf.dim() == 4:
-                depth_conf = depth_conf[0]  # (N, H, W)
-            if conf_track_raw is not None and conf_track_raw.dim() == 4:
-                conf_track_raw = conf_track_raw[0]
-
-            if depth_conf is not None and conf_track_raw is not None:
-                valid_geo, _ = compute_valid_mask(depth_conf, conf_track_raw)
-            else:
-                valid_geo = torch.ones(N_raw, H_raw, W_raw, dtype=torch.bool, device=device)
-
-            if track_b is not None:
-                scene_scale = depth_b[0].median().clamp(min=1e-6).item()
-                _, dyn_mask = compute_dynamic_mask(track_b, scene_scale=scene_scale)
-            else:
-                dyn_mask = torch.zeros(H_raw, W_raw, dtype=torch.bool, device=device)
-                scene_scale = 1.0
-
-        structured_output = {
-            "pts": pts_tensor,
-            "track": track_b if track_b is not None else torch.zeros(N_raw, H_raw, W_raw, 3, device=device),
-            "extrinsic": c2w_tensor,
-            "intrinsic": int_tensor,
-        }
-
-        loss = self.recon_reward.compute_differentiable_loss(
-            structured_output, valid_geo, dyn_mask, scene_scale
-        )
-
         try:
-            grad = torch.autograd.grad(loss, x0_hat, retain_graph=False)[0]
-        except RuntimeError as e:
+            grad = self._compute_guidance_gradient(x0_hat)
+        except Exception as e:
             warnings.warn(
-                f"Gradient guidance failed (likely broken grad chain): {e}. "
-                "Ensure VAE has decode_differentiable() that preserves gradients.",
+                f"[GeometricGuidance] Gradient computation failed at step {step_idx}: {e}",
                 stacklevel=2,
             )
             return v_pred
 
+        if grad is None:
+            return v_pred
+
+        # WMReward-style normalization:
+        # scale = guidance_scale * (||v_pred|| / ||grad||) * (1 - sigma_t^2)
         scaling_t = 1.0 - sigma_t ** 2
         norm_ratio = v_pred.norm(2) / (grad.norm(2) + 1e-8)
         v_guided = v_pred + self.cfg.guidance_scale * norm_ratio * scaling_t * grad
 
         return v_guided
 
-    def _differentiable_decode(self, x0_hat):
+    def _compute_guidance_gradient(self, x0_hat):
         """
-        Differentiable VAE decode.
+        Full forward pass: VAE decode → sample frames → 4RC → geometric loss → grad.
 
-        Requires vae.decode_differentiable() — a custom path that does NOT
-        use torch.no_grad(). Standard Wan2.2 VAE decode wraps in no_grad
-        and will break the gradient chain from x0_hat through to the loss.
+        Bypasses 4RC's inference() wrapper (which has @torch.no_grad) and calls
+        loss_of_one_batch() directly to preserve the gradient chain.
+
+        Returns:
+            Gradient tensor with same shape as x0_hat, or None on failure.
         """
-        try:
-            if hasattr(self.vae, 'decode_differentiable'):
-                return self.vae.decode_differentiable(x0_hat)
-            else:
-                warnings.warn(
-                    "VAE has no decode_differentiable() method. "
-                    "Standard decode() likely breaks gradient flow. "
-                    "Gradient guidance will be a no-op until this is implemented.",
-                    stacklevel=2,
-                )
-                return self.vae.decode(x0_hat)
-        except Exception as e:
-            warnings.warn(
-                f"Differentiable VAE decode failed: {e}. "
-                "Gradient guidance skipped for this step.",
-                stacklevel=2,
-            )
+        # VAE decode (differentiable path)
+        video = self.vae.decode_differentiable(x0_hat)
+        if video is None:
             return None
 
-    def _sample_fixed_frames(self, video, n=8):
-        """Sample n uniformly spaced frames from decoded video tensor."""
-        # video: (B, 3, T, H, W) or (3, T, H, W)
-        if video.dim() == 5:
-            video = video[0]
+        # Sample frames uniformly
+        # video shape: (3, T, H, W)
         T = video.shape[1]
+        n = max(1, min(self.guidance_frames, T))
         indices = torch.linspace(0, T - 1, n).long()
-        return video[:, indices]  # (3, n, H, W)
+        frames = video[:, indices]  # (3, n, H, W)
 
-    def _prepare_views_differentiable(self, frames):
+        # Prepare 4RC input views (differentiable)
+        views = self._prepare_views(frames)
+
+        # 4RC forward — bypass inference() which has @torch.no_grad.
+        # Call loss_of_one_batch() directly with enable_grad.
+        from arc.dust3r.inference_multiview import loss_of_one_batch
+        from arc.dust3r.utils.device import collate_with_cat
+
+        device = next(self.model_4rc.parameters()).device
+        batch = collate_with_cat([tuple(views)])
+
+        with torch.enable_grad():
+            result = loss_of_one_batch(
+                batch, self.model_4rc, None, device, "bf16-mixed",
+            )
+
+        preds = result["preds"]
+        N_frames = len(preds)
+
+        # Extract outputs (keeping gradient flow through pts and track)
+        pts_list = []
+        track_list = []
+        ext_list = []
+        int_list = []
+        conf_list = []
+        conf_track_list = []
+
+        for i in range(N_frames):
+            pred = preds[i]
+            pts_list.append(pred["pts"].squeeze(0))
+            track_list.append(pred["track"].squeeze(0))
+            ext_list.append(pred["extrinsic"])
+            int_list.append(pred["intrinsic"])
+            conf_list.append(pred["conf"].squeeze(0))
+            conf_track_list.append(pred["conf_track"].squeeze(0))
+
+        pts = torch.stack(pts_list)
+        track_abs = torch.stack(track_list)
+        extrinsics = torch.stack(ext_list)
+        intrinsics = torch.stack(int_list)
+        conf = torch.stack(conf_list)
+        conf_track = torch.stack(conf_track_list)
+
+        # Convert track to relative displacement (same as fourrc_adapter)
+        track = track_abs - pts[0].unsqueeze(0)
+
+        # Compute masks (detached — no gradient through conf)
+        with torch.no_grad():
+            valid_geo, valid_track = compute_valid_mask(
+                conf, conf_track, quantile=self.cfg.conf_valid_quantile
+            )
+            scene_scale = compute_scene_scale(pts, extrinsic_frame0=extrinsics[0])
+            _, dynamic_mask = compute_dynamic_mask(
+                track.detach(),
+                threshold_ratio=self.cfg.dynamic_threshold_ratio,
+                scene_scale=scene_scale,
+            )
+
+        # Compute differentiable loss
+        structured_output = {
+            "pts": pts,
+            "track": track,
+            "extrinsic": extrinsics,
+            "intrinsic": intrinsics,
+        }
+
+        loss = self.recon_reward.compute_differentiable_loss(
+            structured_output, valid_geo, dynamic_mask, scene_scale
+        )
+
+        # Backprop to x0_hat
+        grad = torch.autograd.grad(loss, x0_hat, retain_graph=False)[0]
+        return grad
+
+    def _prepare_views(self, frames):
         """
         Prepare frames as 4RC views while maintaining gradient flow.
 
@@ -246,16 +213,51 @@ class GeometricGuidance:
         Returns:
             List of view dicts with 'img' as differentiable tensors.
         """
+        import numpy as np
+
         N = frames.shape[1]
+        target_size = max(self.cfg.image_size, 14)
+        patch_size = 14
+
         views = []
         for i in range(N):
             frame = frames[:, i]  # (3, H, W)
-            H, W = frame.shape[1], frame.shape[2]
+            H_in, W_in = frame.shape[1], frame.shape[2]
+
+            # Resize to target size (differentiable bilinear interpolation)
+            scale = target_size / max(H_in, W_in)
+            new_H = max(patch_size, int(round(H_in * scale)))
+            new_W = max(patch_size, int(round(W_in * scale)))
+            frame_resized = F.interpolate(
+                frame.unsqueeze(0), size=(new_H, new_W),
+                mode='bilinear', align_corners=False
+            ).squeeze(0)  # (3, new_H, new_W)
+
+            # Crop to patch-aligned size (center crop)
+            cx, cy = new_W // 2, new_H // 2
+            halfw = ((2 * cx) // patch_size) * patch_size // 2
+            halfh = ((2 * cy) // patch_size) * patch_size // 2
+
+            # Guard: ensure at least one patch (should not happen with the clamp above)
+            if halfw < patch_size // 2 or halfh < patch_size // 2:
+                halfw = max(halfw, patch_size // 2)
+                halfh = max(halfh, patch_size // 2)
+                # Ensure indices stay in bounds
+                halfw = min(halfw, cx, new_W - cx)
+                halfh = min(halfh, cy, new_H - cy)
+
+            frame_cropped = frame_resized[
+                :,
+                cy - halfh: cy + halfh,
+                cx - halfw: cx + halfw,
+            ]  # (3, H_crop, W_crop)
+
+            H_out, W_out = frame_cropped.shape[1], frame_cropped.shape[2]
+
             views.append({
-                "img": frame.unsqueeze(0),  # (1, 3, H, W)
-                "true_shape": torch.tensor([[H, W]], dtype=torch.int32),
+                "img": frame_cropped.unsqueeze(0),  # (1, 3, H, W)
+                "true_shape": np.int32([[H_out, W_out]]),
                 "idx": i,
                 "instance": str(i),
             })
         return views
-

@@ -7,14 +7,14 @@
 ```
 now/
 ├── geo_reward/                  # 核心模块
-│   ├── __init__.py              # 导出 DA3GeoReward, GeometryRewardConfig, ReconstructionReward, ReconRewardConfig, GeoRewardBoN, GeoRewardBoNProgressive, GeoRewardBoNProgressiveV2, GeoRewardBoNTreeBranching, GeometricGuidance
+│   ├── __init__.py              # 导出 DA3GeoReward, GeometryRewardConfig, ReconstructionReward, ReconRewardConfig, GeoRewardBoN, GeoRewardBoNProgressive, GeoRewardBoNProgressiveV2, GeoRewardBoNProgressiveV2Guided, GeoRewardBoNTreeBranching, GeometricGuidance
 │   ├── da3_reward.py            # DA3GeoReward 主类 + GeometryRewardConfig + compute_reward_early（V1 保留）
 │   ├── recon_reward.py          # 【V2 新增】ReconstructionReward + ReconRewardConfig（4RC 显式几何一致性）
 │   ├── fourrc_adapter.py        # 【V2 新增】4RC 接口适配（PIL→view、valid_mask、dynamic_mask）
-│   ├── guidance.py              # 【V2 新增】梯度引导模块（Phase 3，GeometricGuidance）
+│   ├── guidance.py              # 【V2 Phase 3】梯度引导模块（GeometricGuidance，集成到去噪循环）
 │   ├── region_masks.py          # 静态/动态区域分割（帧差+深度变化率+OR组合）（V1 保留）
 │   ├── motion_reward.py         # 运动质量评分（motion_gate + R_shape + R_smoothness）（V1 保留）
-│   ├── bon_pipeline.py          # GeoRewardBoN / GeoRewardBoNProgressive（V1）/ GeoRewardBoNProgressiveV2（V2+模型交替加载）/ GeoRewardBoNTreeBranching（Tree Branching 加速）/ GeoRewardBoNOffline
+│   ├── bon_pipeline.py          # GeoRewardBoN / GeoRewardBoNProgressive（V1）/ GeoRewardBoNProgressiveV2（V2+模型交替加载）/ GeoRewardBoNProgressiveV2Guided（V2+梯度引导）/ GeoRewardBoNTreeBranching（Tree Branching 加速）/ GeoRewardBoNOffline
 │   └── utils.py                 # 格式转换（wan→PIL）、均匀抽帧、坐标变换
 ├── run_bon.py                   # 单条 BoN CLI（--mode bon / score）
 ├── run_bon_batch.py             # 批量 BoN CLI（--start/--end，模型只加载一次）
@@ -130,7 +130,7 @@ conf_valid_quantile = 0.20    # conf 有效阈值分位数（Q20，保留 top 80
 image_size = 518              # 4RC 输入分辨率
 ```
 
-### 梯度引导（Phase 3，待验证后启用）
+### 梯度引导（Phase 3，已集成代码）
 
 ```python
 L_guidance = L_reproj + 0.5 × L_track_smoothness + 0.3 × L_anchor
@@ -138,7 +138,21 @@ L_guidance = L_reproj + 0.5 × L_track_smoothness + 0.3 × L_anchor
 
 - 对显式几何 loss 求梯度，不对 conf 求梯度
 - WMReward 风格归一化：`v_guided = v_pred + scale * norm_ratio * scaling_t * grad`
-- `GeometricGuidance` 类封装，通过 `should_guide(sigma_t)` 控制引导窗口
+- `GeometricGuidance` 类封装，通过 `should_guide(sigma_t, step_idx)` 控制引导窗口
+- `GeoRewardBoNProgressiveV2Guided` 管线类将 guidance 集成到渐进淘汰流程
+- `denoise_candidates_with_guidance()` 在去噪循环中调用 guidance，每个 guidance step 自动处理 DiT↔4RC 显存交替
+- VAE 通过 `decode_differentiable()` 保持梯度流（不使用 torch.no_grad）
+- 引导窗口默认 sigma ∈ [0.08, 0.90]，每 5 步引导一次
+- `--guidance` 仅在不使用渐进淘汰且不使用 tree_branching 时生效（独立开关）
+
+#### 显存管理（guidance step）
+
+```
+DiT forward → noise_pred (no_grad) → offload DiT to CPU
+→ load 4RC + keep VAE on GPU → VAE decode_differentiable(pred_x0)
+→ 4RC forward → geometric loss → grad → offload 4RC
+→ modify v_pred → reload DiT → scheduler.step
+```
 
 ## Best-of-N 渐进淘汰设计（两阶段固定比例）
 
@@ -455,6 +469,41 @@ CUDA_VISIBLE_DEVICES=2 python run_bon_batch_v2.py --start 25 --end 48 \
   --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
   --prompts batch_prompts_real.json --name_prefix test_tree \
   --t5_cpu --sample_shift 5.0
+
+# ===== 梯度引导（Phase 3，独立于渐进淘汰） =====
+# 注意：--guidance 仅在 --no_progressive 且不使用 --tree_branching 时生效
+
+# V2 梯度引导 + 顺序 BoN（单条，N=8 逐个引导生成后评分选优）
+python run_bon_v2.py \
+  --guidance --no_progressive \
+  --guidance_scale 0.001 --guidance_frequency 5 \
+  --guidance_sigma_min 0.08 --guidance_sigma_max 0.90 \
+  --guidance_frames 8 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --image /path/to/first_frame.png \
+  --prompt "动作指令" \
+  --N 8 --size 480*832 --sample_shift 5.0 --t5_cpu
+
+# V2 梯度引导（批量）
+python run_bon_batch_v2.py \
+  --start 1 --end 24 \
+  --guidance --no_progressive \
+  --guidance_scale 0.001 --guidance_frequency 5 \
+  --guidance_sigma_min 0.08 --guidance_sigma_max 0.90 \
+  --guidance_frames 8 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json \
+  --name_prefix test_guided \
+  --t5_cpu --sample_shift 5.0
+
+# 对比实验配置：
+#   vanilla:          --no_progressive（无引导无淘汰，顺序生成 + 随机选）
+#   guidance only:    --guidance --no_progressive（引导生成 + 评分选优）
+#   BoN only:         默认（渐进淘汰选优，无引导）
+#   guidance + BoN:   暂不支持同时开启（未来可扩展）
 ```
 
 ## 关键技术细节
@@ -500,7 +549,7 @@ total_motion_weight = 0.70     # R_motion 在总分中的权重
   - Phase 0：Reward 信号验证（扰动退化实验 + 候选间方差分析 + V1 交叉验证）
   - Phase 1：完整 BoN（4RC reward 选优 vs random vs V1）
   - Phase 2：Progressive BoN（验证 early score 与 final score 相关性）
-  - Phase 3：梯度引导 + BoN（GeometricGuidance 模块已就绪，待 Phase 1/2 验证）
+  - Phase 3：梯度引导 + BoN（代码已完成：GeometricGuidance + GeoRewardBoNProgressiveV2Guided + denoise_candidates_with_guidance + VAE decode_differentiable，待 Phase 1/2 验证后启用）
 - **Tree Branching**（代码已完成）：共享主干 + 分叉加速（GeoRewardBoNTreeBranching）
   - 相比渐进淘汰再省 ~29% DiT 步数（134 vs 190）
   - 待验证：η=0 退化测试、不同 η 多样性对比、加速比实测、质量对比

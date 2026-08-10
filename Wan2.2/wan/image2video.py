@@ -642,6 +642,148 @@ class WanI2V:
 
         return last_noise_preds, last_pre_step_latents
 
+    def denoise_candidates_with_guidance(
+        self, state, alive_indices, start_step, end_step, guidance,
+        guidance_offload_dit=None, guidance_reload_dit=None,
+    ):
+        """
+        Run denoising steps [start_step, end_step) with geometric guidance.
+
+        Same as denoise_candidates() but applies guidance.guided_v_pred() at
+        eligible steps. Guidance requires 4RC + VAE on GPU, so the caller
+        provides offload/reload callbacks for the DiT model.
+
+        Args:
+            state: Progressive generation state dict.
+            alive_indices: List of candidate indices still alive.
+            start_step, end_step: Step range (exclusive end).
+            guidance: GeometricGuidance instance.
+            guidance_offload_dit: Callable to move DiT to CPU before guidance.
+            guidance_reload_dit: Callable to reload DiT to GPU after guidance.
+
+        Returns:
+            (last_noise_preds, last_pre_step_latents) same as denoise_candidates.
+        """
+        offload_model = state['offload_model']
+        guide_scale = state['guide_scale']
+        timesteps = state['timesteps']
+        boundary = self.boundary * self.num_train_timesteps
+
+        arg_c = {
+            'context': [state['context'][0]],
+            'seq_len': state['max_seq_len'],
+            'y': [state['y']],
+        }
+        arg_null = {
+            'context': state['context_null'],
+            'seq_len': state['max_seq_len'],
+            'y': [state['y']],
+        }
+
+        last_noise_preds = {}
+        last_pre_step_latents = {}
+
+        with torch.amp.autocast('cuda', dtype=self.param_dtype):
+            if offload_model:
+                torch.cuda.empty_cache()
+
+            for step_idx in range(start_step, end_step):
+                t = timesteps[step_idx]
+                is_phase_last_step = (step_idx == end_step - 1)
+
+                # Get current sigma for guidance check.
+                # step_index may be None before the first scheduler.step() call;
+                # fall back to using step_idx to index sigmas directly.
+                scheduler_ref = state['candidates'][alive_indices[0]]['scheduler']
+                si = scheduler_ref.step_index
+                if si is None:
+                    si = step_idx
+                sigma_t = float(scheduler_ref.sigmas[si])
+                needs_guidance = guidance.should_guide(sigma_t, step_idx)
+
+                # Standard DiT forward (with no_grad as usual)
+                with torch.no_grad():
+                    model = self._prepare_model_for_timestep(
+                        t, boundary, offload_model)
+                    sample_guide_scale = (
+                        guide_scale[1] if t.item() >= boundary
+                        else guide_scale[0]
+                    )
+
+                    for cand_idx in alive_indices:
+                        cand = state['candidates'][cand_idx]
+                        latent = cand['latent']
+                        scheduler = cand['scheduler']
+
+                        latent_model_input = [latent.to(self.device)]
+                        timestep = torch.stack([t]).to(self.device)
+
+                        noise_pred_cond = model(
+                            latent_model_input, t=timestep, **arg_c)[0]
+                        noise_pred_uncond = model(
+                            latent_model_input, t=timestep, **arg_null)[0]
+                        noise_pred = noise_pred_uncond + sample_guide_scale * (
+                            noise_pred_cond - noise_pred_uncond)
+
+                        if is_phase_last_step:
+                            last_noise_preds[cand_idx] = noise_pred
+                            last_pre_step_latents[cand_idx] = latent.clone()
+
+                        # Store noise_pred temporarily for guidance modification
+                        cand['_pending_noise_pred'] = noise_pred
+
+                        del latent_model_input, timestep
+                        del noise_pred_cond, noise_pred_uncond
+
+                # Apply guidance if conditions met
+                if needs_guidance:
+                    # Offload DiT to make room for 4RC + VAE
+                    if guidance_offload_dit is not None:
+                        guidance_offload_dit()
+
+                    for cand_idx in alive_indices:
+                        cand = state['candidates'][cand_idx]
+                        latent = cand['latent']
+                        noise_pred = cand['_pending_noise_pred']
+
+                        guided_pred = guidance.guided_v_pred(
+                            latent, noise_pred, sigma_t, step_idx
+                        )
+                        cand['_pending_noise_pred'] = guided_pred
+
+                    # Reload DiT for next step
+                    if guidance_reload_dit is not None:
+                        guidance_reload_dit()
+
+                # Scheduler step (always with no_grad)
+                with torch.no_grad():
+                    for cand_idx in alive_indices:
+                        cand = state['candidates'][cand_idx]
+                        latent = cand['latent']
+                        scheduler = cand['scheduler']
+                        noise_pred = cand.pop('_pending_noise_pred')
+
+                        if is_phase_last_step and needs_guidance:
+                            last_noise_preds[cand_idx] = noise_pred
+
+                        temp = scheduler.step(
+                            noise_pred.unsqueeze(0),
+                            t,
+                            latent.unsqueeze(0),
+                            return_dict=False,
+                            generator=cand['generator'])[0]
+                        cand['latent'] = temp.squeeze(0)
+
+                if offload_model:
+                    torch.cuda.empty_cache()
+
+            if offload_model:
+                self.low_noise_model.cpu()
+                self.high_noise_model.cpu()
+                torch.cuda.empty_cache()
+
+        return last_noise_preds, last_pre_step_latents
+
     def extract_pred_x0(self, state, cand_idx, noise_pred, pre_step_latent):
         """
         Compute the clean-latent prediction: x0 = x_t - sigma_t * v_pred.

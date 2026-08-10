@@ -31,6 +31,7 @@ import wan
 from wan.configs import MAX_AREA_CONFIGS, WAN_CONFIGS
 from wan.utils.utils import save_video
 from geo_reward import ReconstructionReward, ReconRewardConfig, GeoRewardBoNProgressiveV2, GeoRewardBoNTreeBranching
+from geo_reward.guidance import GeometricGuidance
 
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,20 @@ def parse_args():
     parser.add_argument("--branch_eta", type=float, default=0.10,
                         help="Branch diversity hyperparameter η (default: 0.10).")
 
+    # Gradient guidance (Phase 3)
+    parser.add_argument("--guidance", action="store_true",
+                        help="Enable gradient guidance during denoising (Phase 3).")
+    parser.add_argument("--guidance_scale", type=float, default=0.001,
+                        help="Guidance gradient scale (default: 0.001).")
+    parser.add_argument("--guidance_frequency", type=int, default=5,
+                        help="Apply guidance every N steps within sigma window (default: 5).")
+    parser.add_argument("--guidance_sigma_min", type=float, default=0.08,
+                        help="Minimum σ for guidance window (default: 0.08).")
+    parser.add_argument("--guidance_sigma_max", type=float, default=0.90,
+                        help="Maximum σ for guidance window (default: 0.45).")
+    parser.add_argument("--guidance_frames", type=int, default=8,
+                        help="Number of frames sampled for guidance (fewer = faster, default: 8).")
+
     # V2 reward weights
     parser.add_argument("--static_weight", type=float, default=0.40,
                         help="R_static weight in total reward.")
@@ -154,7 +169,7 @@ def parse_args():
 
 
 def build_recon_config(args):
-    return ReconRewardConfig(
+    cfg = ReconRewardConfig(
         static_weight=args.static_weight,
         dynamic_weight=args.dynamic_weight,
         motion_weight=args.motion_weight,
@@ -172,6 +187,12 @@ def build_recon_config(args):
         max_frames=args.max_frames,
         image_size=args.image_size,
     )
+    if hasattr(args, 'guidance') and args.guidance:
+        cfg.guidance_scale = args.guidance_scale
+        cfg.guidance_frequency = args.guidance_frequency
+        cfg.sigma_min = args.guidance_sigma_min
+        cfg.sigma_max = args.guidance_sigma_max
+    return cfg
 
 
 def load_4rc_model(model_path, device="cpu"):
@@ -235,6 +256,29 @@ def main():
     )
 
     use_progressive = not args.no_progressive
+
+    # Validate guidance compatibility
+    if args.guidance and (use_progressive or args.tree_branching):
+        logger.warning(
+            "--guidance is incompatible with progressive elimination and tree_branching. "
+            "Gradient guidance only works with sequential BoN (--no_progressive). "
+            "Ignoring --guidance flag."
+        )
+        args.guidance = False
+
+    # Set up guidance object if enabled (used in the sequential loop below)
+    guidance_obj = None
+    if args.guidance:
+        guidance_obj = GeometricGuidance(
+            model_4rc=fourrc_model,
+            vae=wan_i2v.vae,
+            cfg=cfg,
+            guidance_frames=args.guidance_frames,
+        )
+        logger.info(f"Mode: Guided Sequential BoN V2 "
+                    f"(guidance_scale={args.guidance_scale}, "
+                    f"freq={args.guidance_frequency}, "
+                    f"sigma=[{args.guidance_sigma_min}, {args.guidance_sigma_max}])")
 
     if args.tree_branching:
         N = args.num_trunks * args.branches_per_trunk
@@ -344,20 +388,69 @@ def main():
             candidates = []
             rewards = []
 
+            img_pil = Image.open(image_path).convert("RGB")
+
             for i in range(args.N):
                 seed = seed_base + i
-                video = wan_i2v.generate(
-                    input_prompt=prompt,
-                    img=Image.open(image_path).convert("RGB"),
-                    frame_num=args.frame_num,
-                    seed=seed,
-                    max_area=MAX_AREA_CONFIGS[args.size],
-                    shift=args.sample_shift,
-                    sample_solver=args.sample_solver,
-                    sampling_steps=args.sampling_steps,
-                    guide_scale=args.guide_scale,
-                    offload_model=True,
-                )
+
+                if guidance_obj is not None:
+                    # Guided generation
+                    state = wan_i2v.prepare_progressive(
+                        input_prompt=prompt,
+                        img=img_pil,
+                        seeds=[seed],
+                        frame_num=args.frame_num,
+                        max_area=MAX_AREA_CONFIGS[args.size],
+                        shift=args.sample_shift,
+                        sample_solver=args.sample_solver,
+                        sampling_steps=args.sampling_steps,
+                        guide_scale=args.guide_scale,
+                        offload_model=True,
+                    )
+                    total_steps = len(state['timesteps'])
+
+                    def _g_offload():
+                        wan_i2v.low_noise_model.cpu()
+                        wan_i2v.high_noise_model.cpu()
+                        torch.cuda.empty_cache()
+                        fourrc_model.cuda()
+                        if hasattr(wan_i2v.vae, 'model'):
+                            wan_i2v.vae.model.cuda()
+                        else:
+                            wan_i2v.vae.cuda()
+
+                    def _g_reload():
+                        fourrc_model.cpu()
+                        torch.cuda.empty_cache()
+                        dev = wan_i2v.device
+                        if next(wan_i2v.low_noise_model.parameters()).device.type != dev.type:
+                            wan_i2v.low_noise_model.to(dev)
+                        if next(wan_i2v.high_noise_model.parameters()).device.type != dev.type:
+                            wan_i2v.high_noise_model.to(dev)
+
+                    wan_i2v.denoise_candidates_with_guidance(
+                        state, [0], 0, total_steps,
+                        guidance=guidance_obj,
+                        guidance_offload_dit=_g_offload,
+                        guidance_reload_dit=_g_reload,
+                    )
+                    video = wan_i2v.decode_latent(state['candidates'][0]['latent'])
+                    wan_i2v.cleanup_progressive(
+                        state, offload_model=state.get('offload_model', True))
+                else:
+                    video = wan_i2v.generate(
+                        input_prompt=prompt,
+                        img=img_pil,
+                        frame_num=args.frame_num,
+                        seed=seed,
+                        max_area=MAX_AREA_CONFIGS[args.size],
+                        shift=args.sample_shift,
+                        sample_solver=args.sample_solver,
+                        sampling_steps=args.sampling_steps,
+                        guide_scale=args.guide_scale,
+                        offload_model=True,
+                    )
+
                 if video is None:
                     continue
 
@@ -403,6 +496,7 @@ def main():
                 "image": str(image_path.resolve()),
                 "reward_version": "v2_4rc",
                 "progressive": False,
+                "guidance": args.guidance,
                 "best_idx": best_idx,
                 "best_reward": rewards[best_idx],
                 "total_time_sec": elapsed,
