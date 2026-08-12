@@ -581,7 +581,7 @@ class WanVAE_(nn.Module):
         for CHUNK_SIZE=3) instead of all 21 iterations (~82GB).
         Temporal gradient is preserved within chunks; only cut at boundaries.
         """
-        CHUNK_SIZE = 3
+        CHUNK_SIZE = 1
 
         self.clear_cache()
         if isinstance(scale[0], torch.Tensor):
