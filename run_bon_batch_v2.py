@@ -268,12 +268,28 @@ def main():
 
     # Set up guidance object if enabled (used in the sequential loop below)
     guidance_obj = None
+    dual_gpu_guidance = False
     if args.guidance:
+        # Detect dual-GPU mode
+        if torch.cuda.device_count() >= 2:
+            dual_gpu_guidance = True
+            guidance_device = torch.device("cuda:1")
+            logger.info("Dual-GPU guidance: DiT on cuda:0, 4RC+VAE on cuda:1")
+            fourrc_model.to(guidance_device)
+            recon_reward.device = str(guidance_device)
+            if hasattr(wan_i2v.vae, 'model'):
+                wan_i2v.vae.model.to(guidance_device)
+            else:
+                wan_i2v.vae.to(guidance_device)
+        else:
+            guidance_device = None
+
         guidance_obj = GeometricGuidance(
             model_4rc=fourrc_model,
             vae=wan_i2v.vae,
             cfg=cfg,
             guidance_frames=args.guidance_frames,
+            guidance_device=guidance_device,
         )
         logger.info(f"Mode: Guided Sequential BoN V2 "
                     f"(guidance_scale={args.guidance_scale}, "
@@ -409,36 +425,51 @@ def main():
                     )
                     total_steps = len(state['timesteps'])
 
-                    def _g_offload():
-                        wan_i2v.low_noise_model.cpu()
-                        wan_i2v.high_noise_model.cpu()
-                        torch.cuda.empty_cache()
-                        fourrc_model.cuda()
-                        if hasattr(wan_i2v.vae, 'model'):
-                            wan_i2v.vae.model.cuda()
-                        else:
-                            wan_i2v.vae.cuda()
+                    if dual_gpu_guidance:
+                        # Dual-GPU: no offload/reload needed
+                        wan_i2v.denoise_candidates_with_guidance(
+                            state, [0], 0, total_steps,
+                            guidance=guidance_obj,
+                            guidance_offload_dit=None,
+                            guidance_reload_dit=None,
+                        )
+                    else:
+                        # Single-GPU fallback
+                        def _g_offload():
+                            wan_i2v.low_noise_model.cpu()
+                            wan_i2v.high_noise_model.cpu()
+                            torch.cuda.empty_cache()
+                            fourrc_model.cuda()
+                            if hasattr(wan_i2v.vae, 'model'):
+                                wan_i2v.vae.model.cuda()
+                            else:
+                                wan_i2v.vae.cuda()
 
-                    def _g_reload():
-                        fourrc_model.cpu()
-                        if hasattr(wan_i2v.vae, 'model'):
-                            wan_i2v.vae.model.cpu()
-                        else:
-                            wan_i2v.vae.cpu()
-                        torch.cuda.empty_cache()
-                        dev = wan_i2v.device
-                        if next(wan_i2v.low_noise_model.parameters()).device.type != dev.type:
-                            wan_i2v.low_noise_model.to(dev)
-                        if next(wan_i2v.high_noise_model.parameters()).device.type != dev.type:
-                            wan_i2v.high_noise_model.to(dev)
+                        def _g_reload():
+                            fourrc_model.cpu()
+                            if hasattr(wan_i2v.vae, 'model'):
+                                wan_i2v.vae.model.cpu()
+                            else:
+                                wan_i2v.vae.cpu()
+                            torch.cuda.empty_cache()
+                            dev = wan_i2v.device
+                            if next(wan_i2v.low_noise_model.parameters()).device.type != dev.type:
+                                wan_i2v.low_noise_model.to(dev)
+                            if next(wan_i2v.high_noise_model.parameters()).device.type != dev.type:
+                                wan_i2v.high_noise_model.to(dev)
 
-                    wan_i2v.denoise_candidates_with_guidance(
-                        state, [0], 0, total_steps,
-                        guidance=guidance_obj,
-                        guidance_offload_dit=_g_offload,
-                        guidance_reload_dit=_g_reload,
-                    )
-                    video = wan_i2v.decode_latent(state['candidates'][0]['latent'])
+                        wan_i2v.denoise_candidates_with_guidance(
+                            state, [0], 0, total_steps,
+                            guidance=guidance_obj,
+                            guidance_offload_dit=_g_offload,
+                            guidance_reload_dit=_g_reload,
+                        )
+
+                    # Final VAE decode: in dual-GPU mode, move latent to VAE's device
+                    latent_for_decode = state['candidates'][0]['latent']
+                    if dual_gpu_guidance:
+                        latent_for_decode = latent_for_decode.to(guidance_device)
+                    video = wan_i2v.decode_latent(latent_for_decode)
                     wan_i2v.cleanup_progressive(
                         state, offload_model=state.get('offload_model', True))
                 else:
@@ -460,7 +491,7 @@ def main():
 
                 candidates.append(video)
 
-                if offload_models:
+                if offload_models and not dual_gpu_guidance:
                     wan_i2v.low_noise_model.cpu()
                     wan_i2v.high_noise_model.cpu()
                     torch.cuda.empty_cache()
@@ -472,7 +503,7 @@ def main():
                 r = recon_reward.compute_reward(sampled)
                 rewards.append(r)
 
-                if offload_models:
+                if offload_models and not dual_gpu_guidance:
                     fourrc_model.cpu()
                     torch.cuda.empty_cache()
 
