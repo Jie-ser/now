@@ -5,6 +5,7 @@ import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from einops import rearrange
 
 __all__ = [
@@ -567,6 +568,89 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return out
 
+    def decode_checkpointed(self, z, scale):
+        """Decode with gradient checkpointing to reduce activation memory.
+
+        Chunks temporal iterations into groups. Within each chunk, the causal
+        conv cache flows differentiably (preserving temporal gradients). At
+        chunk boundaries, the cache is detached (cutting gradient only there).
+        Each chunk is wrapped in torch.utils.checkpoint to discard intermediate
+        activations.
+
+        Peak memory: ~CHUNK_SIZE iterations' worth of activations (~12-16GB
+        for CHUNK_SIZE=3) instead of all 21 iterations (~82GB).
+        Temporal gradient is preserved within chunks; only cut at boundaries.
+        """
+        CHUNK_SIZE = 3
+
+        self.clear_cache()
+        if isinstance(scale[0], torch.Tensor):
+            z_grad = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1)
+        else:
+            z_grad = z / scale[1] + scale[0]
+        iter_ = z_grad.shape[2]
+        x_grad = self.conv2(z_grad)
+
+        live_cache = list(self._feat_map)  # starts as [None, None, ...]
+
+        out = None
+        for chunk_start in range(0, iter_, CHUNK_SIZE):
+            chunk_end = min(chunk_start + CHUNK_SIZE, iter_)
+
+            # Collect tensor entries from live_cache as explicit checkpoint inputs
+            tensor_inputs = []
+            meta_entries = {}  # non-tensor entries (None, 'Rep')
+            slot_to_pos = {}   # cache_slot_index -> position in cache_tensors
+            for k, entry in enumerate(live_cache):
+                if isinstance(entry, torch.Tensor):
+                    slot_to_pos[k] = len(tensor_inputs)
+                    tensor_inputs.append(entry)
+                else:
+                    meta_entries[k] = entry
+
+            def run_chunk(x_full, *cache_tensors,
+                          _start=chunk_start, _end=chunk_end,
+                          _slot_to_pos=slot_to_pos,
+                          _meta_entries=meta_entries):
+                # Rebuild feat_map from explicit tensor args + meta entries
+                for k in range(len(self._feat_map)):
+                    if k in _meta_entries:
+                        self._feat_map[k] = _meta_entries[k]
+                    else:
+                        self._feat_map[k] = cache_tensors[_slot_to_pos[k]]
+
+                chunk_out = None
+                for i in range(_start, _end):
+                    self._conv_idx = [0]
+                    out_i = self.decoder(
+                        x_full[:, :, i:i + 1, :, :],
+                        feat_cache=self._feat_map,
+                        feat_idx=self._conv_idx)
+                    if chunk_out is None:
+                        chunk_out = out_i
+                    else:
+                        chunk_out = torch.cat([chunk_out, out_i], 2)
+                return chunk_out
+
+            chunk_out = torch_checkpoint(
+                run_chunk, x_grad, *tensor_inputs, use_reentrant=False)
+
+            if out is None:
+                out = chunk_out
+            else:
+                out = torch.cat([out, chunk_out], 2)
+
+            # Detach cache at chunk boundary for next chunk
+            # (the decoder left self._feat_map in post-chunk state during forward)
+            live_cache = [
+                t.detach() if isinstance(t, torch.Tensor) else t
+                for t in self._feat_map
+            ]
+
+        self.clear_cache()
+        return out
+
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
@@ -664,12 +748,12 @@ class Wan2_1_VAE:
 
     def decode_differentiable(self, z):
         """
-        Differentiable VAE decode for gradient guidance.
+        Differentiable VAE decode with gradient checkpointing.
 
-        Unlike decode(), this does NOT use torch.no_grad() and preserves
-        gradient flow from input latent through to output video tensor.
-        The VAE parameters remain frozen (requires_grad=False) but the
-        input tensor's gradient is tracked.
+        Temporal iterations are grouped into chunks of 3. Within each chunk,
+        gradients flow through the causal conv cache (preserving temporal
+        coherence). At chunk boundaries the cache is detached. Each chunk is
+        wrapped in torch.utils.checkpoint to discard intermediate activations.
 
         Args:
             z: Single latent tensor (C, T, H, W) with requires_grad=True.
@@ -678,5 +762,5 @@ class Wan2_1_VAE:
             Video tensor (3, T_out, H_out, W_out) in [-1, 1], gradient-connected to z.
         """
         with torch.enable_grad(), amp.autocast(dtype=self.dtype):
-            out = self.model.decode(z.unsqueeze(0), self.scale)
+            out = self.model.decode_checkpointed(z.unsqueeze(0), self.scale)
             return out.float().clamp(-1, 1).squeeze(0)
