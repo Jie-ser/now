@@ -481,14 +481,8 @@ def run_bon(args):
                 logger.info(f"  Dual-GPU guidance: DiT on cuda:0, 4RC+VAE on cuda:1")
                 fourrc_model.to(guidance_device)
                 recon_reward.device = str(guidance_device)
-                if hasattr(wan_i2v.vae, 'model'):
-                    wan_i2v.vae.model.to(guidance_device)
-                    # Also move mean/std/scale tensors (Wan2_1_VAE is not nn.Module)
-                    wan_i2v.vae.mean = wan_i2v.vae.mean.to(guidance_device)
-                    wan_i2v.vae.std = wan_i2v.vae.std.to(guidance_device)
-                    wan_i2v.vae.scale = [wan_i2v.vae.mean, 1.0 / wan_i2v.vae.std]
-                else:
-                    wan_i2v.vae.to(guidance_device)
+                # VAE is moved to guidance_device AFTER prepare_progressive
+                # (which needs vae.encode on cuda:0 for first-frame encoding)
             else:
                 guidance_device = None
 
@@ -524,6 +518,15 @@ def run_bon(args):
                 total_steps = len(state['timesteps'])
 
                 if dual_gpu_guidance:
+                    # Move VAE to guidance device now (after encode is done)
+                    if hasattr(wan_i2v.vae, 'model'):
+                        wan_i2v.vae.model.to(guidance_device)
+                        wan_i2v.vae.mean = wan_i2v.vae.mean.to(guidance_device)
+                        wan_i2v.vae.std = wan_i2v.vae.std.to(guidance_device)
+                        wan_i2v.vae.scale = [wan_i2v.vae.mean, 1.0 / wan_i2v.vae.std]
+                    else:
+                        wan_i2v.vae.to(guidance_device)
+
                     # Dual-GPU: no offload/reload needed, models stay on their GPUs
                     wan_i2v.denoise_candidates_with_guidance(
                         state, [0], 0, total_steps,
@@ -563,11 +566,23 @@ def run_bon(args):
                         guidance_reload_dit=_guidance_reload,
                     )
 
-                # Final VAE decode: in dual-GPU mode, move latent to VAE's device
+                # Final VAE decode: in dual-GPU mode, VAE is already on guidance_device
                 latent_for_decode = state['candidates'][0]['latent']
                 if dual_gpu_guidance:
                     latent_for_decode = latent_for_decode.to(guidance_device)
                 video = wan_i2v.decode_latent(latent_for_decode)
+
+                # Move VAE back to cuda:0 for next candidate's prepare_progressive
+                if dual_gpu_guidance:
+                    dit_device = torch.device("cuda:0")
+                    if hasattr(wan_i2v.vae, 'model'):
+                        wan_i2v.vae.model.to(dit_device)
+                        wan_i2v.vae.mean = wan_i2v.vae.mean.to(dit_device)
+                        wan_i2v.vae.std = wan_i2v.vae.std.to(dit_device)
+                        wan_i2v.vae.scale = [wan_i2v.vae.mean, 1.0 / wan_i2v.vae.std]
+                    else:
+                        wan_i2v.vae.to(dit_device)
+
                 wan_i2v.cleanup_progressive(
                     state, offload_model=state.get('offload_model', True))
             else:
