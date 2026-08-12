@@ -483,6 +483,10 @@ def run_bon(args):
                 recon_reward.device = str(guidance_device)
                 if hasattr(wan_i2v.vae, 'model'):
                     wan_i2v.vae.model.to(guidance_device)
+                    # Also move mean/std/scale tensors (Wan2_1_VAE is not nn.Module)
+                    wan_i2v.vae.mean = wan_i2v.vae.mean.to(guidance_device)
+                    wan_i2v.vae.std = wan_i2v.vae.std.to(guidance_device)
+                    wan_i2v.vae.scale = [wan_i2v.vae.mean, 1.0 / wan_i2v.vae.std]
                 else:
                     wan_i2v.vae.to(guidance_device)
             else:
@@ -503,6 +507,8 @@ def run_bon(args):
 
             if guidance_obj is not None:
                 # Guided generation: use prepare_progressive + denoise_with_guidance
+                # In dual-GPU mode, DiT has full GPU — no need to offload high/low models
+                dit_offload = (not args.no_offload_model) and (not dual_gpu_guidance)
                 state = wan_i2v.prepare_progressive(
                     input_prompt=args.prompt,
                     img=img,
@@ -513,7 +519,7 @@ def run_bon(args):
                     sample_solver=args.sample_solver,
                     sampling_steps=args.sampling_steps,
                     guide_scale=args.guide_scale,
-                    offload_model=not args.no_offload_model,
+                    offload_model=dit_offload,
                 )
                 total_steps = len(state['timesteps'])
 
