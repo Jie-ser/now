@@ -17,13 +17,18 @@ Integration:
   Called from denoise_candidates_with_guidance() in WanI2V, which invokes
   guidance.guided_v_pred() after computing noise_pred but before scheduler.step().
 
-Memory management (dual-GPU mode):
-  When guidance_device is set (e.g. "cuda:1"), 4RC and VAE live permanently on
-  that device. pred_x0 is transferred to guidance_device for forward+backward,
-  and the resulting gradient is transferred back to the DiT device. No model
-  offloading is needed — each GPU holds its own models at all times.
+Memory management (multi-GPU mode):
+  3-GPU mode (vae_device + fourrc_device):
+    GPU0: DiT (denoising loop)
+    GPU1: VAE decode_differentiable (activations stay here)
+    GPU2: 4RC geometric forward + loss + backward (activations stay here)
+    Gradient chain crosses devices via differentiable .to() ops.
 
-  Single-GPU mode (guidance_device=None) still works with offload callbacks.
+  2-GPU mode (guidance_device):
+    GPU0: DiT
+    GPU1: VAE + 4RC (legacy, may OOM on large resolutions)
+
+  Single-GPU mode (no device args): works with offload callbacks.
 """
 
 import warnings
@@ -44,24 +49,32 @@ class GeometricGuidance:
     """
 
     def __init__(self, model_4rc, vae, cfg=None, guidance_frames=8,
-                 guidance_device=None):
+                 guidance_device=None, vae_device=None, fourrc_device=None):
         """
         Args:
             model_4rc: 4RC (Arc) model, must allow gradient flow.
             vae: Wan2.2 VAE (Wan2_1_VAE instance with decode_differentiable).
             cfg: ReconRewardConfig with guidance parameters.
             guidance_frames: Number of frames to sample for guidance (fewer = faster).
-            guidance_device: Device where 4RC + VAE reside for guidance computation.
-                If None, uses same device as model_4rc (single-GPU with offloading).
-                If set (e.g. "cuda:1"), enables dual-GPU mode: pred_x0 is transferred
-                to this device, forward+backward runs there, grad is sent back.
+            guidance_device: (Legacy 2-GPU) Device where BOTH 4RC and VAE reside.
+            vae_device: (3-GPU) Device where VAE resides (e.g. "cuda:1").
+            fourrc_device: (3-GPU) Device where 4RC resides (e.g. "cuda:2").
         """
         self.model_4rc = model_4rc
         self.vae = vae
         self.cfg = cfg or ReconRewardConfig()
         self.guidance_frames = guidance_frames
-        self.guidance_device = torch.device(guidance_device) if guidance_device else None
         self.recon_reward = ReconstructionReward(model=model_4rc, cfg=self.cfg)
+
+        if vae_device is not None and fourrc_device is not None:
+            self.vae_device = torch.device(vae_device)
+            self.fourrc_device = torch.device(fourrc_device)
+        elif guidance_device is not None:
+            self.vae_device = torch.device(guidance_device)
+            self.fourrc_device = torch.device(guidance_device)
+        else:
+            self.vae_device = None
+            self.fourrc_device = None
 
     def should_guide(self, sigma_t, step_idx):
         """Check whether guidance should be applied at this noise level and step."""
@@ -121,22 +134,22 @@ class GeometricGuidance:
         """
         Full forward pass: VAE decode → sample frames → 4RC → geometric loss → grad.
 
-        In dual-GPU mode, x0_hat is transferred to guidance_device, the entire
-        forward+backward runs there, and the gradient is sent back to x0_hat's
-        original device.
+        In multi-GPU mode, x0_hat is transferred to vae_device for VAE decode,
+        frames are transferred to fourrc_device for 4RC, and the resulting
+        gradient is sent back to x0_hat's original device.
 
         Returns:
             Gradient tensor on x0_hat's original device, or None on failure.
         """
         src_device = x0_hat.device
 
-        # In dual-GPU mode, move x0_hat to the guidance device
-        if self.guidance_device is not None and self.guidance_device != src_device:
-            x0_work = x0_hat.to(self.guidance_device).requires_grad_(True)
+        # Transfer x0_hat to VAE device
+        if self.vae_device is not None and self.vae_device != src_device:
+            x0_work = x0_hat.to(self.vae_device).requires_grad_(True)
         else:
             x0_work = x0_hat
 
-        # VAE decode (differentiable path)
+        # VAE decode (differentiable path) — runs on vae_device
         video = self.vae.decode_differentiable(x0_work)
         if video is None:
             return None
@@ -146,9 +159,10 @@ class GeometricGuidance:
         T = video.shape[1]
         n = max(1, min(self.guidance_frames, T))
         indices = torch.linspace(0, T - 1, n).long()
-        frames = video[:, indices]  # (3, n, H, W)
+        frames = video[:, indices]  # (3, n, H, W) — on vae_device
 
         # Prepare 4RC input views (differentiable)
+        # frames are transferred to fourrc_device inside _prepare_views
         views = self._prepare_views(frames)
 
         # 4RC forward — bypass inference() which has @torch.no_grad.
@@ -156,7 +170,7 @@ class GeometricGuidance:
         from arc.dust3r.inference_multiview import loss_of_one_batch
         from arc.dust3r.utils.device import collate_with_cat
 
-        device_4rc = next(self.model_4rc.parameters()).device
+        device_4rc = self.fourrc_device or next(self.model_4rc.parameters()).device
         batch = collate_with_cat([tuple(views)])
 
         with torch.enable_grad():
@@ -222,7 +236,7 @@ class GeometricGuidance:
         grad_on_device = torch.autograd.grad(loss, x0_work, retain_graph=False)[0]
 
         # Transfer gradient back to source device if needed
-        if self.guidance_device is not None and self.guidance_device != src_device:
+        if self.vae_device is not None and self.vae_device != src_device:
             return grad_on_device.to(src_device)
         return grad_on_device
 
@@ -230,11 +244,14 @@ class GeometricGuidance:
         """
         Prepare frames as 4RC views while maintaining gradient flow.
 
+        Frames are resized/cropped on their current device, then transferred
+        to fourrc_device (if set) for 4RC forward. The .to() is differentiable.
+
         Args:
             frames: (3, N, H, W) tensor in [-1, 1].
 
         Returns:
-            List of view dicts with 'img' as differentiable tensors.
+            List of view dicts with 'img' as differentiable tensors on fourrc_device.
         """
         import numpy as np
 
@@ -274,6 +291,10 @@ class GeometricGuidance:
                 cy - halfh: cy + halfh,
                 cx - halfw: cx + halfw,
             ]  # (3, H_crop, W_crop)
+
+            # Transfer to 4RC device (differentiable — autograd tracks cross-device copy)
+            if self.fourrc_device is not None:
+                frame_cropped = frame_cropped.to(self.fourrc_device)
 
             H_out, W_out = frame_cropped.shape[1], frame_cropped.shape[2]
 

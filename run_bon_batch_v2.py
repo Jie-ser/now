@@ -269,25 +269,36 @@ def main():
     # Set up guidance object if enabled (used in the sequential loop below)
     guidance_obj = None
     dual_gpu_guidance = False
+    tri_gpu_guidance = False
     if args.guidance:
-        # Detect dual-GPU mode
-        if torch.cuda.device_count() >= 2:
+        if torch.cuda.device_count() >= 3:
+            # 3-GPU: DiT on cuda:0, VAE on cuda:1, 4RC on cuda:2
+            tri_gpu_guidance = True
             dual_gpu_guidance = True
-            guidance_device = torch.device("cuda:1")
+            vae_device = torch.device("cuda:1")
+            fourrc_device = torch.device("cuda:2")
+            logger.info("3-GPU guidance: DiT on cuda:0, VAE on cuda:1, 4RC on cuda:2")
+            fourrc_model.to(fourrc_device)
+            recon_reward.device = str(fourrc_device)
+        elif torch.cuda.device_count() >= 2:
+            # 2-GPU: DiT on cuda:0, 4RC+VAE on cuda:1
+            dual_gpu_guidance = True
+            vae_device = torch.device("cuda:1")
+            fourrc_device = torch.device("cuda:1")
             logger.info("Dual-GPU guidance: DiT on cuda:0, 4RC+VAE on cuda:1")
-            fourrc_model.to(guidance_device)
-            recon_reward.device = str(guidance_device)
-            # VAE is moved to guidance_device AFTER each prepare_progressive call
-            # (which needs vae.encode on cuda:0 for first-frame encoding)
+            fourrc_model.to(fourrc_device)
+            recon_reward.device = str(fourrc_device)
         else:
-            guidance_device = None
+            vae_device = None
+            fourrc_device = None
 
         guidance_obj = GeometricGuidance(
             model_4rc=fourrc_model,
             vae=wan_i2v.vae,
             cfg=cfg,
             guidance_frames=args.guidance_frames,
-            guidance_device=guidance_device,
+            vae_device=vae_device,
+            fourrc_device=fourrc_device,
         )
         logger.info(f"Mode: Guided Sequential BoN V2 "
                     f"(guidance_scale={args.guidance_scale}, "
@@ -426,16 +437,16 @@ def main():
                     total_steps = len(state['timesteps'])
 
                     if dual_gpu_guidance:
-                        # Move VAE to guidance device (after encode is done)
+                        # Move VAE to vae_device (after encode is done)
                         if hasattr(wan_i2v.vae, 'model'):
-                            wan_i2v.vae.model.to(guidance_device)
-                            wan_i2v.vae.mean = wan_i2v.vae.mean.to(guidance_device)
-                            wan_i2v.vae.std = wan_i2v.vae.std.to(guidance_device)
+                            wan_i2v.vae.model.to(vae_device)
+                            wan_i2v.vae.mean = wan_i2v.vae.mean.to(vae_device)
+                            wan_i2v.vae.std = wan_i2v.vae.std.to(vae_device)
                             wan_i2v.vae.scale = [wan_i2v.vae.mean, 1.0 / wan_i2v.vae.std]
                         else:
-                            wan_i2v.vae.to(guidance_device)
+                            wan_i2v.vae.to(vae_device)
 
-                        # Dual-GPU: no offload/reload needed
+                        # Multi-GPU: no offload/reload needed
                         wan_i2v.denoise_candidates_with_guidance(
                             state, [0], 0, total_steps,
                             guidance=guidance_obj,
@@ -474,10 +485,10 @@ def main():
                             guidance_reload_dit=_g_reload,
                         )
 
-                    # Final VAE decode: in dual-GPU mode, VAE is already on guidance_device
+                    # Final VAE decode: in multi-GPU mode, VAE is on vae_device
                     latent_for_decode = state['candidates'][0]['latent']
                     if dual_gpu_guidance:
-                        latent_for_decode = latent_for_decode.to(guidance_device)
+                        latent_for_decode = latent_for_decode.to(vae_device)
                     video = wan_i2v.decode_latent(latent_for_decode)
 
                     # Move VAE back to cuda:0 for next candidate's prepare_progressive
