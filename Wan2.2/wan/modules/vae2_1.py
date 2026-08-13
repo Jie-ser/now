@@ -429,21 +429,25 @@ class Decoder3d(nn.Module):
         """
         Split decoder layers across two devices.
 
-        Front half (conv1 + middle + stage0 + stage1) → device_1
-        Back half (stage2 + stage3 + head) → device_2
+        Front half (conv1 + middle + stage0 + stage1 + stage2 ResBlocks) → device_1
+        Back half (stage2 Resample + stage3 + head) → device_2
 
-        The split point is after self.upsamples[split_layer_idx - 1].
+        The memory-expensive spatial upsample (240×416 → 480×832) and all
+        subsequent full-resolution layers run on device_2.
+
         For default config (dim_mult=[1,2,4,4], num_res_blocks=2, attn_scales=[]):
           stage0 = 4 layers [0-3], stage1 = 4 layers [4-7]
-          stage2 = 4 layers [8-11], stage3 = 3 layers [12-14]
-          split_layer_idx = 8 (first layer of stage2)
+          stage2 = 3 ResBlocks [8-10] + 1 Resample [11]
+          stage3 = 3 layers [12-14]
+          split_layer_idx = 11 (stage2 Resample — first full-res layer)
         """
-        # Recompute split point by replaying the __init__ loop logic for stages 0 and 1
+        # Recompute split point: stages 0,1,2 ResBlocks on device_1;
+        # stage2 Resample + stage3 + head on device_2
         dims = [self.dim * u for u in [self.dim_mult[-1]] + self.dim_mult[::-1]]
         scale = 1.0 / 2**(len(self.dim_mult) - 2)
         count = 0
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
-            if i >= 2:
+            if i >= 3:
                 break
             if i == 1 or i == 2 or i == 3:
                 in_dim = in_dim // 2
@@ -452,9 +456,14 @@ class Decoder3d(nn.Module):
                 if scale in self.attn_scales:
                     count += 1  # AttentionBlock
                 in_dim = out_dim
+            # Include Resample for stages 0 and 1 only (they stay on device_1)
             if i != len(self.dim_mult) - 1:
-                count += 1  # Resample
-                scale *= 2.0
+                if i < 2:
+                    count += 1  # Resample stays on device_1
+                    scale *= 2.0
+                else:
+                    # stage2 Resample is the split point (goes to device_2)
+                    scale *= 2.0
 
         split_idx = count
         self.split_layer_idx = split_idx
