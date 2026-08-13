@@ -437,7 +437,7 @@ def main():
                 if guidance_obj is not None:
                     # Guided generation
                     # In multi-GPU mode, DiT has full GPU — no offload needed
-                    dit_offload = (not args.no_offload_model) and (not dual_gpu_guidance)
+                    dit_offload = (not args.no_model_offload) and (not dual_gpu_guidance)
                     state = wan_i2v.prepare_progressive(
                         input_prompt=prompt,
                         img=img_pil,
