@@ -421,6 +421,56 @@ class Decoder3d(nn.Module):
             RMS_norm(out_dim, images=False), nn.SiLU(),
             CausalConv3d(out_dim, 3, 3, padding=1))
 
+        # Split-device support: None means single device (default)
+        self.split_layer_idx = None
+        self.device_2 = None
+
+    def split_to_devices(self, device_1, device_2):
+        """
+        Split decoder layers across two devices.
+
+        Front half (conv1 + middle + stage0 + stage1) → device_1
+        Back half (stage2 + stage3 + head) → device_2
+
+        The split point is after self.upsamples[split_layer_idx - 1].
+        For default config (dim_mult=[1,2,4,4], num_res_blocks=2, attn_scales=[]):
+          stage0 = 4 layers [0-3], stage1 = 4 layers [4-7]
+          stage2 = 4 layers [8-11], stage3 = 3 layers [12-14]
+          split_layer_idx = 8 (first layer of stage2)
+        """
+        # Recompute split point by replaying the __init__ loop logic for stages 0 and 1
+        dims = [self.dim * u for u in [self.dim_mult[-1]] + self.dim_mult[::-1]]
+        scale = 1.0 / 2**(len(self.dim_mult) - 2)
+        count = 0
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+            if i >= 2:
+                break
+            if i == 1 or i == 2 or i == 3:
+                in_dim = in_dim // 2
+            for _ in range(self.num_res_blocks + 1):
+                count += 1  # ResidualBlock
+                if scale in self.attn_scales:
+                    count += 1  # AttentionBlock
+                in_dim = out_dim
+            if i != len(self.dim_mult) - 1:
+                count += 1  # Resample
+                scale *= 2.0
+
+        split_idx = count
+        self.split_layer_idx = split_idx
+        self.device_2 = device_2
+
+        # Move front half to device_1
+        self.conv1.to(device_1)
+        self.middle.to(device_1)
+        for i in range(split_idx):
+            self.upsamples[i].to(device_1)
+
+        # Move back half to device_2
+        for i in range(split_idx, len(self.upsamples)):
+            self.upsamples[i].to(device_2)
+        self.head.to(device_2)
+
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         ## conv1
         if feat_cache is not None:
@@ -447,7 +497,9 @@ class Decoder3d(nn.Module):
                 x = layer(x)
 
         ## upsamples
-        for layer in self.upsamples:
+        for layer_i, layer in enumerate(self.upsamples):
+            if self.split_layer_idx is not None and layer_i == self.split_layer_idx:
+                x = x.to(self.device_2)
             if feat_cache is not None:
                 x = layer(x, feat_cache, feat_idx)
             else:
@@ -709,6 +761,7 @@ class Wan2_1_VAE:
                  device="cuda"):
         self.dtype = dtype
         self.device = device
+        self.vae_device_2 = None
 
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -737,6 +790,20 @@ class Wan2_1_VAE:
                 self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                 for u in videos
             ]
+
+    def split_decoder_to_devices(self, device_1, device_2):
+        """
+        Split VAE decoder across two GPUs for memory reduction.
+
+        Front half (conv1 + middle + stage0 + stage1) stays on device_1.
+        Back half (stage2 + stage3 + head) moves to device_2.
+
+        scale tensors and conv2 remain on device_1 (input side).
+        """
+        self.vae_device_2 = device_2
+        self.model.decoder.split_to_devices(device_1, device_2)
+        # conv2 stays on device_1 (processes z before decoder)
+        self.model.conv2.to(device_1)
 
     def decode(self, zs):
         with amp.autocast(dtype=self.dtype):

@@ -474,12 +474,25 @@ def run_bon(args):
         guidance_obj = None
         dual_gpu_guidance = False
         tri_gpu_guidance = False
+        quad_gpu_guidance = False
         if args.guidance:
-            if torch.cuda.device_count() >= 3:
+            if torch.cuda.device_count() >= 4:
+                # 4-GPU: DiT on cuda:0, VAE front on cuda:1, VAE back on cuda:2, 4RC on cuda:3
+                quad_gpu_guidance = True
+                tri_gpu_guidance = True
+                dual_gpu_guidance = True
+                vae_device = torch.device("cuda:1")
+                vae_device_2 = torch.device("cuda:2")
+                fourrc_device = torch.device("cuda:3")
+                logger.info(f"  4-GPU guidance: DiT cuda:0, VAE-front cuda:1, VAE-back cuda:2, 4RC cuda:3")
+                fourrc_model.to(fourrc_device)
+                recon_reward.device = str(fourrc_device)
+            elif torch.cuda.device_count() >= 3:
                 # 3-GPU: DiT on cuda:0, VAE on cuda:1, 4RC on cuda:2
                 tri_gpu_guidance = True
                 dual_gpu_guidance = True
                 vae_device = torch.device("cuda:1")
+                vae_device_2 = None
                 fourrc_device = torch.device("cuda:2")
                 logger.info(f"  3-GPU guidance: DiT on cuda:0, VAE on cuda:1, 4RC on cuda:2")
                 fourrc_model.to(fourrc_device)
@@ -488,12 +501,14 @@ def run_bon(args):
                 # 2-GPU: DiT on cuda:0, 4RC+VAE on cuda:1
                 dual_gpu_guidance = True
                 vae_device = torch.device("cuda:1")
+                vae_device_2 = None
                 fourrc_device = torch.device("cuda:1")
                 logger.info(f"  Dual-GPU guidance: DiT on cuda:0, 4RC+VAE on cuda:1")
                 fourrc_model.to(fourrc_device)
                 recon_reward.device = str(fourrc_device)
             else:
                 vae_device = None
+                vae_device_2 = None
                 fourrc_device = None
 
             guidance_obj = GeometricGuidance(
@@ -503,6 +518,7 @@ def run_bon(args):
                 guidance_frames=args.guidance_frames,
                 vae_device=vae_device,
                 fourrc_device=fourrc_device,
+                vae_device_2=vae_device_2,
             )
 
         for i in range(args.N):
@@ -530,7 +546,13 @@ def run_bon(args):
 
                 if dual_gpu_guidance:
                     # Move VAE to vae_device now (after encode is done)
-                    if hasattr(wan_i2v.vae, 'model'):
+                    if quad_gpu_guidance:
+                        # 4-GPU: split decoder across cuda:1 and cuda:2
+                        wan_i2v.vae.split_decoder_to_devices(vae_device, vae_device_2)
+                        wan_i2v.vae.mean = wan_i2v.vae.mean.to(vae_device)
+                        wan_i2v.vae.std = wan_i2v.vae.std.to(vae_device)
+                        wan_i2v.vae.scale = [wan_i2v.vae.mean, 1.0 / wan_i2v.vae.std]
+                    elif hasattr(wan_i2v.vae, 'model'):
                         wan_i2v.vae.model.to(vae_device)
                         wan_i2v.vae.mean = wan_i2v.vae.mean.to(vae_device)
                         wan_i2v.vae.std = wan_i2v.vae.std.to(vae_device)
@@ -588,6 +610,8 @@ def run_bon(args):
                     dit_device = torch.device("cuda:0")
                     if hasattr(wan_i2v.vae, 'model'):
                         wan_i2v.vae.model.to(dit_device)
+                        wan_i2v.vae.model.decoder.split_layer_idx = None
+                        wan_i2v.vae.model.decoder.device_2 = None
                         wan_i2v.vae.mean = wan_i2v.vae.mean.to(dit_device)
                         wan_i2v.vae.std = wan_i2v.vae.std.to(dit_device)
                         wan_i2v.vae.scale = [wan_i2v.vae.mean, 1.0 / wan_i2v.vae.std]

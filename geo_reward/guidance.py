@@ -18,6 +18,13 @@ Integration:
   guidance.guided_v_pred() after computing noise_pred but before scheduler.step().
 
 Memory management (multi-GPU mode):
+  4-GPU mode (vae_device + vae_device_2 + fourrc_device):
+    GPU0: DiT (denoising loop)
+    GPU1: VAE decoder front half (conv2 + conv1 + middle + stage0 + stage1)
+    GPU2: VAE decoder back half (stage2 + stage3 + head)
+    GPU3: 4RC geometric forward + loss + backward
+    Gradient chain crosses devices via differentiable .to() ops.
+
   3-GPU mode (vae_device + fourrc_device):
     GPU0: DiT (denoising loop)
     GPU1: VAE decode_differentiable (activations stay here)
@@ -49,7 +56,8 @@ class GeometricGuidance:
     """
 
     def __init__(self, model_4rc, vae, cfg=None, guidance_frames=8,
-                 guidance_device=None, vae_device=None, fourrc_device=None):
+                 guidance_device=None, vae_device=None, fourrc_device=None,
+                 vae_device_2=None):
         """
         Args:
             model_4rc: 4RC (Arc) model, must allow gradient flow.
@@ -57,8 +65,10 @@ class GeometricGuidance:
             cfg: ReconRewardConfig with guidance parameters.
             guidance_frames: Number of frames to sample for guidance (fewer = faster).
             guidance_device: (Legacy 2-GPU) Device where BOTH 4RC and VAE reside.
-            vae_device: (3-GPU) Device where VAE resides (e.g. "cuda:1").
-            fourrc_device: (3-GPU) Device where 4RC resides (e.g. "cuda:2").
+            vae_device: (3/4-GPU) Device where VAE front half resides (e.g. "cuda:1").
+            fourrc_device: (3/4-GPU) Device where 4RC resides (e.g. "cuda:2" or "cuda:3").
+            vae_device_2: (4-GPU) Device where VAE back half resides (e.g. "cuda:2").
+                          VAE output lands on this device; frames are then sent to fourrc_device.
         """
         self.model_4rc = model_4rc
         self.vae = vae
@@ -75,6 +85,12 @@ class GeometricGuidance:
         else:
             self.vae_device = None
             self.fourrc_device = None
+
+        self.vae_device_2 = torch.device(vae_device_2) if vae_device_2 is not None else None
+        # vae_device_2 is stored for reference/logging only. The actual cross-device
+        # transfer during VAE decode is handled internally by Decoder3d.forward()
+        # after split_to_devices() is called — guidance does not need to move tensors
+        # between VAE halves explicitly.
 
     def should_guide(self, sigma_t, step_idx):
         """Check whether guidance should be applied at this noise level and step."""
