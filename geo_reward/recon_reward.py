@@ -32,27 +32,27 @@ from .fourrc_adapter import (
 @dataclass
 class ReconRewardConfig:
     # Weights
-    static_weight: float = 0.40
-    dynamic_weight: float = 0.40
+    static_weight: float = 0.50
+    dynamic_weight: float = 0.30
     motion_weight: float = 0.20
 
     # Dynamic mask
     dynamic_threshold_ratio: float = 0.01
 
     # R_static
-    tau_reproj: float = 0.10
+    tau_reproj: float = 0.05
     occlusion_margin: float = 1.05
 
     # R_dynamic
-    tau_accel: float = 0.05
-    tau_speed: float = 3.0
+    tau_accel: float = 0.02
+    tau_speed: float = 1.5
     max_sample_pixels: int = 1000
 
     # R_motion
     tau_cam: float = 0.02
     tau_rot: float = 0.05
     min_motion: float = 0.005
-    tau_motion: float = 0.005
+    tau_motion: float = 0.02
 
     # Valid mask
     conf_valid_quantile: float = 0.20

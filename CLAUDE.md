@@ -116,16 +116,17 @@ R_total = G_anchor × (0.40 × R_static + 0.40 × R_dynamic + 0.20 × R_motion)
 ### ReconRewardConfig 默认值
 
 ```python
-static_weight = 0.40          # R_static 权重
-dynamic_weight = 0.40         # R_dynamic 权重
+static_weight = 0.50          # R_static 权重（↑ 从 0.40，静态信号更可靠）
+dynamic_weight = 0.30         # R_dynamic 权重（↓ 从 0.40，小区域追踪噪声大）
 motion_weight = 0.20          # R_motion 权重
 dynamic_threshold_ratio = 0.01  # 动态 mask 相对 scene_scale 的阈值
-tau_reproj = 0.10             # 重投影误差温度
-tau_accel = 0.05              # 加速度 penalty 温度
-tau_speed = 3.0               # 极端速度 penalty 温度
+tau_reproj = 0.05             # 重投影误差温度（↓ 从 0.10，更严格）
+tau_accel = 0.02              # 加速度 penalty 温度（↓ 从 0.05，更严格）
+tau_speed = 1.5               # 极端速度 penalty 温度（↓ 从 3.0，更严格）
 tau_cam = 0.02                # 相机加速度温度
 tau_rot = 0.05                # 旋转加速度温度
 min_motion = 0.005            # 最低运动量
+tau_motion = 0.02             # motion gate 温度（↑ 从 0.005，区分力更平缓）
 conf_valid_quantile = 0.20    # conf 有效阈值分位数（Q20，保留 top 80%）
 image_size = 518              # 4RC 输入分辨率
 ```

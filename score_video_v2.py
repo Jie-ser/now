@@ -43,9 +43,9 @@ def parse_args():
                         help="Number of keyframes to sample.")
 
     # V2 reward weights
-    parser.add_argument("--static_weight", type=float, default=0.40,
+    parser.add_argument("--static_weight", type=float, default=0.50,
                         help="R_static weight in total reward.")
-    parser.add_argument("--dynamic_weight", type=float, default=0.40,
+    parser.add_argument("--dynamic_weight", type=float, default=0.30,
                         help="R_dynamic weight in total reward.")
     parser.add_argument("--motion_weight", type=float, default=0.20,
                         help="R_motion weight in total reward.")
@@ -55,15 +55,15 @@ def parse_args():
                         help="Dynamic mask threshold as fraction of scene_scale.")
 
     # R_static
-    parser.add_argument("--tau_reproj", type=float, default=0.10,
+    parser.add_argument("--tau_reproj", type=float, default=0.05,
                         help="Reprojection error temperature.")
     parser.add_argument("--occlusion_margin", type=float, default=1.05,
                         help="Occlusion depth margin multiplier.")
 
     # R_dynamic
-    parser.add_argument("--tau_accel", type=float, default=0.05,
+    parser.add_argument("--tau_accel", type=float, default=0.02,
                         help="Acceleration penalty temperature.")
-    parser.add_argument("--tau_speed", type=float, default=3.0,
+    parser.add_argument("--tau_speed", type=float, default=1.5,
                         help="Extreme speed penalty temperature.")
     parser.add_argument("--max_sample_pixels", type=int, default=1000,
                         help="Max pixels sampled for dynamic trajectory analysis.")
@@ -75,7 +75,7 @@ def parse_args():
                         help="Rotation acceleration temperature.")
     parser.add_argument("--min_motion", type=float, default=0.005,
                         help="Minimum motion for gate activation.")
-    parser.add_argument("--tau_motion", type=float, default=0.005,
+    parser.add_argument("--tau_motion", type=float, default=0.02,
                         help="Motion gate sigmoid temperature.")
 
     # Valid mask
