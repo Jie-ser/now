@@ -23,10 +23,6 @@ def wan_output_to_pil(video_tensor):
     return frames
 
 
-# Backward-compatible alias for V1
-wan_output_to_da3_input = wan_output_to_pil
-
-
 def sample_frames(total_frames=81, max_frames=20):
     """
     Uniformly sample frame indices, always including the first frame.
