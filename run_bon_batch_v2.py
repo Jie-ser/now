@@ -41,15 +41,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 def parse_args():
     parser = argparse.ArgumentParser(description="Batch runner for GeoReward V2 BoN")
 
-    # Batch range
-    parser.add_argument("--start", type=int, required=True, help="First test index, inclusive")
-    parser.add_argument("--end", type=int, required=True, help="Last test index, inclusive")
+    # Batch range (used with --name_prefix mode)
+    parser.add_argument("--start", type=int, default=None, help="First test index, inclusive")
+    parser.add_argument("--end", type=int, default=None, help="Last test index, inclusive")
 
     # Input
     parser.add_argument("--input_dir", type=Path, default=ROOT / "inputs")
     parser.add_argument("--prompts", type=Path, default=ROOT / "batch_prompts.json")
     parser.add_argument("--name_prefix", default="test",
                         help="Input filename and prompt-key prefix.")
+    parser.add_argument("--name_list", action="store_true",
+                        help="Iterate over all keys in prompts JSON (ignores --start/--end/--name_prefix). "
+                             "Use --name_list_start/--name_list_end to slice."  )
+    parser.add_argument("--name_list_start", type=int, default=0,
+                        help="Start index into sorted key list (0-based, inclusive).")
+    parser.add_argument("--name_list_end", type=int, default=None,
+                        help="End index into sorted key list (exclusive). None = all.")
 
     # Wan2.2 model
     parser.add_argument("--ckpt_dir", required=True)
@@ -226,11 +233,25 @@ def find_input_image(input_dir, name):
 
 def main():
     args = parse_args()
-    if args.start < 1 or args.end < args.start:
-        raise ValueError("Require 1 <= start <= end.")
 
     with args.prompts.open(encoding="utf-8") as f:
         prompts = json.load(f)
+
+    if args.name_list:
+        all_keys = sorted(prompts.keys())
+        end_idx = args.name_list_end if args.name_list_end is not None else len(all_keys)
+        name_sequence = all_keys[args.name_list_start:end_idx]
+        if not name_sequence:
+            raise ValueError(f"No keys in range [{args.name_list_start}:{end_idx}] "
+                             f"(total keys: {len(all_keys)})")
+        logger.info(f"name_list mode: {len(name_sequence)} cases "
+                    f"({name_sequence[0]} .. {name_sequence[-1]})")
+    else:
+        if args.start is None or args.end is None:
+            raise ValueError("--start and --end are required unless --name_list is used.")
+        if args.start < 1 or args.end < args.start:
+            raise ValueError("Require 1 <= start <= end.")
+        name_sequence = [f"{args.name_prefix}{i:04d}" for i in range(args.start, args.end + 1)]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -365,14 +386,14 @@ def main():
             value_range=(-1, 1),
         )
 
-    for index in range(args.start, args.end + 1):
-        name = f"{args.name_prefix}{index:04d}"
+    total_cases = len(name_sequence)
+    for case_idx, name in enumerate(name_sequence):
         image_path = find_input_image(args.input_dir, name)
         prompt = prompts.get(name)
         if not prompt:
             raise KeyError(f"Prompt not found for {name} in {args.prompts}")
 
-        logger.info("===== %s (%d/%d) =====", name, index, args.end)
+        logger.info("===== %s (%d/%d) =====", name, case_idx + 1, total_cases)
 
         case_dir = args.output_dir / f"{image_path.stem}_{time.strftime('%Y%m%d_%H%M%S')}"
         case_dir.mkdir(parents=True, exist_ok=True)
