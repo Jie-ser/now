@@ -31,6 +31,7 @@ import wan
 from wan.configs import MAX_AREA_CONFIGS, WAN_CONFIGS
 from wan.utils.utils import save_video
 from geo_reward import ReconstructionReward, ReconRewardConfig, GeoRewardBoNProgressiveV2, GeoRewardBoNTreeBranching
+from geo_reward.bon_pipeline import GeoRewardBoNTreeBranchingGuided
 from geo_reward.guidance import GeometricGuidance
 
 
@@ -121,7 +122,7 @@ def parse_args():
     parser.add_argument("--guidance_sigma_min", type=float, default=0.08,
                         help="Minimum σ for guidance window (default: 0.08).")
     parser.add_argument("--guidance_sigma_max", type=float, default=0.90,
-                        help="Maximum σ for guidance window (default: 0.45).")
+                        help="Maximum σ for guidance window (default: 0.90).")
     parser.add_argument("--guidance_frames", type=int, default=8,
                         help="Number of frames sampled for guidance (fewer = faster, default: 8).")
 
@@ -279,13 +280,20 @@ def main():
     use_progressive = not args.no_progressive
 
     # Validate guidance compatibility
-    if args.guidance and (use_progressive or args.tree_branching):
+    if args.guidance and use_progressive and not args.tree_branching:
         logger.warning(
-            "--guidance is incompatible with progressive elimination and tree_branching. "
-            "Gradient guidance only works with sequential BoN (--no_progressive). "
-            "Ignoring --guidance flag."
+            "--guidance is incompatible with progressive elimination (without tree_branching). "
+            "Gradient guidance only works with sequential BoN (--no_progressive) "
+            "or tree_branching. Ignoring --guidance flag."
         )
         args.guidance = False
+
+    # Apply tree_branching+guidance optimized defaults (user can still override via CLI)
+    if args.guidance and args.tree_branching:
+        if not any(a.startswith('--guidance_frequency') for a in sys.argv):
+            args.guidance_frequency = 3
+        if not any(a.startswith('--guidance_sigma_max') for a in sys.argv):
+            args.guidance_sigma_max = 0.83
 
     # Set up guidance object if enabled (used in the sequential loop below)
     guidance_obj = None
@@ -337,31 +345,80 @@ def main():
             fourrc_device=fourrc_device,
             vae_device_2=vae_device_2,
         )
-        logger.info(f"Mode: Guided Sequential BoN V2 "
-                    f"(guidance_scale={args.guidance_scale}, "
+        logger.info(f"Guidance configured: scale={args.guidance_scale}, "
                     f"freq={args.guidance_frequency}, "
-                    f"sigma=[{args.guidance_sigma_min}, {args.guidance_sigma_max}])")
+                    f"sigma=[{args.guidance_sigma_min}, {args.guidance_sigma_max}]")
 
     if args.tree_branching:
         N = args.num_trunks * args.branches_per_trunk
-        bon = GeoRewardBoNTreeBranching(
-            wan_i2v=wan_i2v,
-            recon_reward=recon_reward,
-            num_trunks=args.num_trunks,
-            branches_per_trunk=args.branches_per_trunk,
-            branch_sigma=args.branch_sigma,
-            branch_eta=args.branch_eta,
-            max_frames=args.max_frames,
-            sigma_checkpoints=args.sigma_checkpoints,
-            elimination_ratio=args.elimination_ratio,
-            min_survivors=args.min_survivors,
-            score_epsilon=args.score_epsilon,
-            early_max_frames=args.early_max_frames,
-            offload_models=offload_models,
-        )
-        logger.info(f"Mode: Tree Branching BoN V2 (trunks={args.num_trunks}, "
-                    f"branches={args.branches_per_trunk}, N={N}, "
-                    f"branch_sigma={args.branch_sigma}, eta={args.branch_eta})")
+        if guidance_obj is not None:
+            # Multi-GPU: no model offload needed
+            tree_offload = (vae_device is None) if args.guidance else offload_models
+
+            def _vae_setup():
+                if quad_gpu_guidance:
+                    wan_i2v.vae.split_decoder_to_devices(vae_device, vae_device_2)
+                elif hasattr(wan_i2v.vae, 'model'):
+                    wan_i2v.vae.model.to(vae_device)
+                else:
+                    wan_i2v.vae.to(vae_device)
+                wan_i2v.vae.mean = wan_i2v.vae.mean.to(vae_device)
+                wan_i2v.vae.std = wan_i2v.vae.std.to(vae_device)
+                wan_i2v.vae.scale = [wan_i2v.vae.mean, 1.0 / wan_i2v.vae.std]
+
+            def _vae_restore():
+                dit_device = torch.device("cuda:0")
+                if hasattr(wan_i2v.vae, 'model'):
+                    wan_i2v.vae.model.to(dit_device)
+                    wan_i2v.vae.model.decoder.split_layer_idx = None
+                    wan_i2v.vae.model.decoder.device_2 = None
+                    wan_i2v.vae.mean = wan_i2v.vae.mean.to(dit_device)
+                    wan_i2v.vae.std = wan_i2v.vae.std.to(dit_device)
+                    wan_i2v.vae.scale = [wan_i2v.vae.mean, 1.0 / wan_i2v.vae.std]
+                else:
+                    wan_i2v.vae.to(dit_device)
+
+            bon = GeoRewardBoNTreeBranchingGuided(
+                wan_i2v=wan_i2v,
+                recon_reward=recon_reward,
+                guidance=guidance_obj,
+                num_trunks=args.num_trunks,
+                branches_per_trunk=args.branches_per_trunk,
+                branch_sigma=args.branch_sigma,
+                branch_eta=args.branch_eta,
+                max_frames=args.max_frames,
+                sigma_checkpoints=args.sigma_checkpoints,
+                elimination_ratio=args.elimination_ratio,
+                min_survivors=args.min_survivors,
+                score_epsilon=args.score_epsilon,
+                early_max_frames=args.early_max_frames,
+                offload_models=tree_offload,
+                vae_setup_fn=_vae_setup if dual_gpu_guidance else None,
+                vae_restore_fn=_vae_restore if dual_gpu_guidance else None,
+            )
+            logger.info(f"Mode: Tree Branching + Guidance BoN V2 "
+                        f"(trunks={args.num_trunks}, branches={args.branches_per_trunk}, "
+                        f"N={N}, branch_sigma={args.branch_sigma}, eta={args.branch_eta}, "
+                        f"guidance_scale={args.guidance_scale}, freq={args.guidance_frequency})")
+        else:
+            bon = GeoRewardBoNTreeBranching(
+                wan_i2v=wan_i2v,
+                recon_reward=recon_reward,
+                num_trunks=args.num_trunks,
+                branches_per_trunk=args.branches_per_trunk,
+                branch_sigma=args.branch_sigma,
+                branch_eta=args.branch_eta,
+                max_frames=args.max_frames,
+                sigma_checkpoints=args.sigma_checkpoints,
+                elimination_ratio=args.elimination_ratio,
+                min_survivors=args.min_survivors,
+                score_epsilon=args.score_epsilon,
+                early_max_frames=args.early_max_frames,
+                offload_models=offload_models,
+            )
+            logger.info(f"Mode: Tree Branching BoN V2 (trunks={args.num_trunks}, "
+                        f"branches={args.branches_per_trunk}, N={N}, "
+                        f"branch_sigma={args.branch_sigma}, eta={args.branch_eta})")
     elif use_progressive:
         N = args.N
         bon = GeoRewardBoNProgressiveV2(
@@ -402,6 +459,8 @@ def main():
 
         if args.tree_branching or use_progressive:
             gen_N = N if args.tree_branching else args.N
+            # In multi-GPU guidance mode, don't offload DiT during denoising
+            dit_offload = not (args.guidance and dual_gpu_guidance)
             best_video, result_log, best_seed = bon.generate(
                 prompt=prompt,
                 image=Image.open(image_path).convert("RGB"),
@@ -415,7 +474,7 @@ def main():
                 sample_solver=args.sample_solver,
                 sampling_steps=args.sampling_steps,
                 guide_scale=args.guide_scale,
-                offload_model=True,
+                offload_model=dit_offload,
             )
             elapsed = time.time() - t0
 

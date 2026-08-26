@@ -7,14 +7,14 @@
 ```
 now/
 ├── geo_reward/                  # 核心模块
-│   ├── __init__.py              # 导出 DA3GeoReward, GeometryRewardConfig, ReconstructionReward, ReconRewardConfig, GeoRewardBoN, GeoRewardBoNProgressive, GeoRewardBoNProgressiveV2, GeoRewardBoNProgressiveV2Guided, GeoRewardBoNTreeBranching, GeometricGuidance
+│   ├── __init__.py              # 导出 DA3GeoReward, GeometryRewardConfig, ReconstructionReward, ReconRewardConfig, GeoRewardBoN, GeoRewardBoNProgressive, GeoRewardBoNProgressiveV2, GeoRewardBoNProgressiveV2Guided, GeoRewardBoNTreeBranching, GeoRewardBoNTreeBranchingGuided, GeometricGuidance
 │   ├── da3_reward.py            # DA3GeoReward 主类 + GeometryRewardConfig + compute_reward_early（V1 保留）
 │   ├── recon_reward.py          # 【V2 新增】ReconstructionReward + ReconRewardConfig（4RC 显式几何一致性）
 │   ├── fourrc_adapter.py        # 【V2 新增】4RC 接口适配（PIL→view、valid_mask、dynamic_mask）
 │   ├── guidance.py              # 【V2 Phase 3】梯度引导模块（GeometricGuidance，集成到去噪循环）
 │   ├── region_masks.py          # 静态/动态区域分割（帧差+深度变化率+OR组合）（V1 保留）
 │   ├── motion_reward.py         # 运动质量评分（motion_gate + R_shape + R_smoothness）（V1 保留）
-│   ├── bon_pipeline.py          # GeoRewardBoN / GeoRewardBoNProgressive（V1）/ GeoRewardBoNProgressiveV2（V2+模型交替加载）/ GeoRewardBoNProgressiveV2Guided（V2+梯度引导）/ GeoRewardBoNTreeBranching（Tree Branching 加速）/ GeoRewardBoNOffline
+│   ├── bon_pipeline.py          # GeoRewardBoN / GeoRewardBoNProgressive（V1）/ GeoRewardBoNProgressiveV2（V2+模型交替加载）/ GeoRewardBoNProgressiveV2Guided（V2+梯度引导）/ GeoRewardBoNTreeBranching（Tree Branching 加速）/ GeoRewardBoNTreeBranchingGuided（Tree Branching+梯度引导）/ GeoRewardBoNOffline
 │   └── utils.py                 # 格式转换（wan→PIL）、均匀抽帧、坐标变换
 ├── run_bon.py                   # 单条 BoN CLI（--mode bon / score）
 ├── run_bon_batch.py             # 批量 BoN CLI（--start/--end，模型只加载一次）
@@ -144,7 +144,7 @@ L_guidance = L_reproj + 0.5 × L_track_smoothness + 0.3 × L_anchor
 - `denoise_candidates_with_guidance()` 在去噪循环中调用 guidance，每个 guidance step 自动处理 DiT↔4RC 显存交替
 - VAE 通过 `decode_differentiable()` 保持梯度流（不使用 torch.no_grad）
 - 引导窗口默认 sigma ∈ [0.08, 0.90]，每 5 步引导一次
-- `--guidance` 仅在不使用渐进淘汰且不使用 tree_branching 时生效（独立开关）
+- `--guidance` 可与 `--tree_branching` 联合使用（首轮淘汰后引导），也可在 `--no_progressive` 时独立使用
 
 #### 显存管理（guidance step）
 
@@ -263,11 +263,32 @@ DEFAULT_BRANCH_ETA = 0.10           # 多样性超参数 η
 
 ### 计算量对比
 
-| 方案 | DiT 步数 | VAE 解码 | Reward 推理 |
-|------|----------|----------|-------------|
-| 朴素 BoN (N=8) | 320 | 8 | 8 |
-| 渐进淘汰 V2 | 190 | 14 | 14 |
-| **Tree Branching** | **134** | **14** | **14** |
+| 方案 | DiT 步数 | VAE 解码 | Reward 推理 | Guidance 次数 |
+|------|----------|----------|-------------|---------------|
+| 朴素 BoN (N=8) | 320 | 8 | 8 | 0 |
+| 渐进淘汰 V2 | 190 | 14 | 14 | 0 |
+| **Tree Branching** | **134** | **14** | **14** | **0** |
+| **Tree Branching + Guidance** | **134** | **14** | **14** | **~3-6（4条×1-2次 + 2条×2-3次）** |
+
+### Tree Branching + Guidance 联合模式
+
+在 Tree Branching 首轮淘汰后开启梯度引导：
+- 主干阶段（σ > 0.90）：不引导（pred_x0 噪声大）
+- 8 条阶段（σ=0.90→0.83）：不引导（代价高、即将淘汰）
+- 4 条阶段（σ=0.83→0.63）：引导 frequency=3（~1-2 次）
+- 2 条阶段（σ=0.63→0.08）：引导 frequency=3（~2-3 次）
+
+通过 `guidance_sigma_max=0.83` 自动控制引导窗口。
+
+4-GPU 常驻布局（无 offload 开销）：
+```
+cuda:0  DiT (low_noise_model + high_noise_model)
+cuda:1  VAE decoder front half
+cuda:2  VAE decoder back half
+cuda:3  4RC model
+```
+
+对应类：`GeoRewardBoNTreeBranchingGuided`（继承 `GeoRewardBoNTreeBranching`，重写 `_progressive_elimination()` 使用 `denoise_candidates_with_guidance()`）。
 
 ## 远程服务器路径
 
@@ -471,8 +492,7 @@ CUDA_VISIBLE_DEVICES=2 python run_bon_batch_v2.py --start 25 --end 48 \
   --prompts batch_prompts_real.json --name_prefix test_tree \
   --t5_cpu --sample_shift 5.0
 
-# ===== 梯度引导（Phase 3，独立于渐进淘汰） =====
-# 注意：--guidance 仅在 --no_progressive 且不使用 --tree_branching 时生效
+# ===== 梯度引导（Phase 3） =====
 
 # V2 梯度引导 + 顺序 BoN（单条，N=8 逐个引导生成后评分选优）
 python run_bon_v2.py \
@@ -500,11 +520,59 @@ python run_bon_batch_v2.py \
   --name_prefix test_guided \
   --t5_cpu --sample_shift 5.0
 
+# ===== Tree Branching + 梯度引导（联合模式） =====
+# guidance 在首轮淘汰（σ=0.83）后开始，frequency=3，sigma_max=0.83
+# 4-GPU 常驻模式：DiT cuda:0, VAE cuda:1/2, 4RC cuda:3
+
+# Tree Branching + Guidance（单条）
+python run_bon_v2.py \
+  --tree_branching --guidance \
+  --num_trunks 2 --branches_per_trunk 4 \
+  --branch_sigma 0.90 --branch_eta 0.10 \
+  --sigma_checkpoints 0.83 0.63 \
+  --guidance_scale 0.001 --guidance_frequency 3 \
+  --guidance_sigma_min 0.08 --guidance_sigma_max 0.83 \
+  --guidance_frames 8 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --image /path/to/first_frame.png \
+  --prompt "动作指令" \
+  --size 480*832 --sample_shift 5.0 --t5_cpu
+
+# Tree Branching + Guidance（批量）
+python run_bon_batch_v2.py \
+  --start 1 --end 24 \
+  --tree_branching --guidance \
+  --num_trunks 2 --branches_per_trunk 4 \
+  --branch_sigma 0.90 --branch_eta 0.10 \
+  --guidance_scale 0.001 --guidance_frequency 3 \
+  --guidance_sigma_min 0.08 --guidance_sigma_max 0.83 \
+  --guidance_frames 8 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json \
+  --name_prefix test_tree_guided \
+  --t5_cpu --sample_shift 5.0
+
+# Tree Branching + Guidance 多卡并行
+CUDA_VISIBLE_DEVICES=0,1,2,3 python run_bon_batch_v2.py --start 1 --end 24 \
+  --tree_branching --guidance \
+  --branch_sigma 0.90 --branch_eta 0.10 \
+  --guidance_scale 0.001 --guidance_frequency 3 \
+  --guidance_sigma_min 0.08 --guidance_sigma_max 0.83 \
+  --ckpt_dir /pfs/mayuema/spj/wan/models/Wan2.2-I2V-A14B \
+  --fourrc_model /pfs/mayuema/spj/now/4RC-main/4RC-main/checkpoints/4RC \
+  --input_dir /pfs/mayuema/spj/now/inputs/inputs_real \
+  --prompts batch_prompts_real.json --name_prefix test_tree_guided \
+  --t5_cpu --sample_shift 5.0
+
 # 对比实验配置：
-#   vanilla:          --no_progressive（无引导无淘汰，顺序生成 + 随机选）
-#   guidance only:    --guidance --no_progressive（引导生成 + 评分选优）
-#   BoN only:         默认（渐进淘汰选优，无引导）
-#   guidance + BoN:   暂不支持同时开启（未来可扩展）
+#   vanilla:                --no_progressive（无引导无淘汰，顺序生成 + 随机选）
+#   guidance only:          --guidance --no_progressive（引导生成 + 评分选优）
+#   BoN only:               默认（渐进淘汰选优，无引导）
+#   tree_branching only:    --tree_branching（Tree Branching 加速选优）
+#   tree + guidance:        --tree_branching --guidance（Tree Branching + 首轮淘汰后引导）
 ```
 
 ## 关键技术细节

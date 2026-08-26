@@ -1097,3 +1097,283 @@ class GeoRewardBoNTreeBranching(GeoRewardBoNProgressiveV2):
               f"(total={best_final_score:.4f}) in {elapsed:.1f}s")
 
         return best_video, result_log, best_seed
+
+
+class GeoRewardBoNTreeBranchingGuided(GeoRewardBoNTreeBranching):
+    """
+    Tree Branching + Gradient Guidance after first elimination.
+
+    Guidance is applied during denoising via denoise_candidates_with_guidance().
+    The guidance sigma window (default sigma_max=0.83) ensures guidance only
+    activates after the first elimination checkpoint, when candidates are fewer
+    and x0 predictions are more reliable.
+
+    Designed for 4-GPU resident mode: DiT cuda:0, VAE cuda:1/2, 4RC cuda:3.
+    No model offload/reload needed during guidance steps.
+    """
+
+    def __init__(self, wan_i2v, recon_reward, guidance,
+                 num_trunks=None, branches_per_trunk=None,
+                 branch_sigma=None, branch_eta=None,
+                 frame_indices=None, max_frames=20,
+                 sigma_checkpoints=None, elimination_ratio=None,
+                 min_survivors=None, score_epsilon=None,
+                 early_max_frames=None, offload_models=True,
+                 vae_setup_fn=None, vae_restore_fn=None):
+        super().__init__(
+            wan_i2v=wan_i2v,
+            recon_reward=recon_reward,
+            num_trunks=num_trunks,
+            branches_per_trunk=branches_per_trunk,
+            branch_sigma=branch_sigma,
+            branch_eta=branch_eta,
+            frame_indices=frame_indices,
+            max_frames=max_frames,
+            sigma_checkpoints=sigma_checkpoints,
+            elimination_ratio=elimination_ratio,
+            min_survivors=min_survivors,
+            score_epsilon=score_epsilon,
+            early_max_frames=early_max_frames,
+            offload_models=offload_models,
+        )
+        self.guidance = guidance
+        self._vae_setup_fn = vae_setup_fn
+        self._vae_restore_fn = vae_restore_fn
+
+    def generate(self, prompt, image, N, frame_num=81, seed_base=None,
+                 output_dir=None, save_fn=None, **wan_kwargs):
+        """
+        Tree Branching + Guidance generation flow.
+
+        Overrides parent to insert VAE device split after prepare_progressive()
+        (encoder needs to be on cuda:0 for encoding, then decoder splits to
+        cuda:1/2 for differentiable guidance decode).
+        """
+        if seed_base is None:
+            seed_base = random.randint(0, 2**31 - 1)
+
+        expected_N = self.num_trunks * self.branches_per_trunk
+        if N != expected_N:
+            print(f"[TreeBranchingGuided] Warning: N={N} != "
+                  f"num_trunks({self.num_trunks}) * "
+                  f"branches_per_trunk({self.branches_per_trunk}) = {expected_N}. "
+                  f"Using {expected_N}.")
+            N = expected_N
+
+        trunk_seeds = [seed_base + i for i in range(self.num_trunks)]
+        branch_seeds = [seed_base + 100 + i for i in range(N)]
+
+        max_cp = max(self.sigma_checkpoints)
+        if self.branch_sigma <= max_cp:
+            raise ValueError(
+                f"branch_sigma({self.branch_sigma}) must be > "
+                f"max(sigma_checkpoints)({max_cp})")
+
+        state = self.wan.prepare_progressive(
+            input_prompt=prompt,
+            img=image,
+            seeds=trunk_seeds,
+            frame_num=frame_num,
+            **wan_kwargs,
+        )
+
+        try:
+            # Split VAE decoder to guidance devices after encode is done
+            if self._vae_setup_fn is not None:
+                self._vae_setup_fn()
+
+            return self._generate_tree(
+                state, N, branch_seeds, frame_num, output_dir, save_fn
+            )
+        finally:
+            try:
+                self.wan.cleanup_progressive(
+                    state, offload_model=state.get('offload_model', True))
+            finally:
+                if self._vae_restore_fn is not None:
+                    self._vae_restore_fn()
+
+    def _progressive_elimination(self, state, N, seeds, frame_num,
+                                  output_dir, save_fn, start_step, t_start):
+        """
+        Progressive elimination with gradient guidance.
+
+        Same as parent but uses denoise_candidates_with_guidance().
+        Guidance sigma window controls when guidance is active — steps with
+        sigma > sigma_max are automatically skipped by should_guide().
+        """
+        total_steps = len(state['timesteps'])
+
+        checkpoint_steps = []
+        seen_end_steps = set()
+        for sigma_target in sorted(self.sigma_checkpoints, reverse=True):
+            end_step = self.wan.find_step_for_sigma(state, sigma_target)
+            if end_step is None or end_step <= start_step or end_step >= total_steps:
+                continue
+            if end_step in seen_end_steps:
+                continue
+            actual_step_idx = end_step - 1
+            actual_sigma = float(
+                state['candidates'][0]['scheduler'].sigmas[actual_step_idx])
+            checkpoint_steps.append({
+                "end_step": end_step,
+                "target_sigma": sigma_target,
+                "actual_sigma": actual_sigma,
+                "scheduler_step_index": actual_step_idx,
+            })
+            seen_end_steps.add(end_step)
+
+        checkpoint_steps.sort(key=lambda item: item["end_step"])
+        checkpoint_steps.append({
+            "end_step": total_steps,
+            "target_sigma": 0.0,
+            "actual_sigma": 0.0,
+            "scheduler_step_index": total_steps,
+        })
+
+        early_frame_indices = sample_frames(frame_num, self.early_max_frames)
+        normal_frame_indices = sample_frames(frame_num, self.max_frames)
+
+        alive = list(range(N))
+        eliminated_at = {}
+        rewards_log = {f"seed_{s}": {} for s in seeds}
+        best_video = None
+        best_cand_idx = None
+        best_final_score = -float("inf")
+        cur_step = start_step
+
+        for cp_idx, cp in enumerate(checkpoint_steps):
+            end_step = cp["end_step"]
+            is_final = (cp_idx == len(checkpoint_steps) - 1)
+            is_early = (cp_idx == 0 and not is_final)
+            phase_name = (
+                "final_sigma0.00" if is_final
+                else f"checkpoint{cp_idx + 1}_sigma{cp['actual_sigma']:.4f}"
+            )
+            frame_indices = early_frame_indices if is_early else normal_frame_indices
+
+            print(f"\n[TreeBranchingGuided] Phase: {phase_name} "
+                  f"(steps {cur_step}->{end_step}, {len(alive)} alive)")
+
+            # Denoise with guidance (sigma window auto-skips high-sigma phases)
+            last_preds, pre_step_latents = self.wan.denoise_candidates_with_guidance(
+                state, alive, cur_step, end_step,
+                guidance=self.guidance,
+                guidance_offload_dit=None,
+                guidance_reload_dit=None,
+            )
+
+            # VAE decode
+            decoded_videos = {}
+            vae_dev = getattr(self.guidance, 'vae_device', None)
+            for cand_idx in alive:
+                if is_final:
+                    latent_to_decode = state['candidates'][cand_idx]['latent']
+                else:
+                    latent_to_decode = self.wan.extract_pred_x0(
+                        state, cand_idx,
+                        last_preds[cand_idx],
+                        pre_step_latents[cand_idx]
+                    )
+                if vae_dev is not None:
+                    latent_to_decode = latent_to_decode.to(vae_dev)
+                video_tensor = self.wan.decode_latent(latent_to_decode)
+                decoded_videos[cand_idx] = video_tensor.cpu()
+                del latent_to_decode, video_tensor
+                torch.cuda.empty_cache()
+
+            # Offload DiT + VAE, load 4RC (only if single-GPU offload mode)
+            if self.offload_models:
+                self._offload_dit()
+                self._offload_vae()
+                self._load_4rc()
+
+            # Score
+            scored = []
+            for cand_idx in alive:
+                seed = seeds[cand_idx]
+                video_tensor = decoded_videos[cand_idx]
+                frames_pil = wan_output_to_pil(video_tensor)
+                sampled = [frames_pil[i] for i in frame_indices
+                           if i < len(frames_pil)]
+                r = self.recon_reward.compute_reward(sampled)
+                rewards_log[f"seed_{seed}"][phase_name] = r
+                scored.append((cand_idx, r))
+
+                print(f"  seed_{seed}: total={r['total']:.4f} "
+                      f"(R_static={r['R_static']:.4f}, "
+                      f"R_dynamic={r['R_dynamic']:.4f}, "
+                      f"R_motion={r['R_motion']:.4f}, "
+                      f"G_anchor={r['G_anchor']:.2f})")
+
+                if output_dir is not None:
+                    self._save_video(
+                        decoded_videos[cand_idx], seed, phase_name,
+                        output_dir, save_fn)
+
+                if is_final:
+                    total = float(r.get('total', float('nan')))
+                    selection_score = total if np.isfinite(total) else -float("inf")
+                    if selection_score > best_final_score:
+                        if best_video is not None:
+                            del best_video
+                        best_video = video_tensor
+                        best_cand_idx = cand_idx
+                        best_final_score = selection_score
+                    else:
+                        del video_tensor
+                else:
+                    del video_tensor
+
+                torch.cuda.empty_cache()
+
+            del decoded_videos
+
+            # Offload 4RC, reload DiT + VAE (only if single-GPU offload mode)
+            if self.offload_models:
+                self._offload_4rc()
+                if not is_final:
+                    self._load_dit()
+                self._load_vae()
+
+            # Eliminate
+            if not is_final:
+                alive, _ = self._eliminate(
+                    scored, seeds, eliminated_at, phase_name, is_early
+                )
+
+            cur_step = end_step
+
+        if best_cand_idx is None:
+            raise RuntimeError("No final candidate was decoded and scored.")
+
+        best_seed = seeds[best_cand_idx]
+        elapsed = time.time() - t_start
+        result_log = self._build_result_log(
+            seeds, rewards_log, eliminated_at, best_seed,
+            sigma_checkpoints=self.sigma_checkpoints,
+            elapsed=elapsed,
+            checkpoint_steps=checkpoint_steps,
+        )
+        result_log["reward_type"] = "v2_4rc"
+        result_log["mode"] = "tree_branching_progressive_guided"
+        result_log["tree_branching"] = {
+            "num_trunks": self.num_trunks,
+            "branches_per_trunk": self.branches_per_trunk,
+            "branch_sigma": self.branch_sigma,
+            "branch_eta": self.branch_eta,
+            "branch_step": start_step,
+        }
+        result_log["guidance"] = {
+            "enabled": True,
+            "scale": self.guidance.cfg.guidance_scale,
+            "frequency": self.guidance.cfg.guidance_frequency,
+            "sigma_min": self.guidance.cfg.sigma_min,
+            "sigma_max": self.guidance.cfg.sigma_max,
+            "guidance_frames": self.guidance.guidance_frames,
+        }
+
+        print(f"\n[TreeBranchingGuided] Best: seed_{best_seed} "
+              f"(total={best_final_score:.4f}) in {elapsed:.1f}s")
+
+        return best_video, result_log, best_seed
