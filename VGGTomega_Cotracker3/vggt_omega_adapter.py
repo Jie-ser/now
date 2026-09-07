@@ -60,7 +60,19 @@ def load_vggt_omega(checkpoint_path, device="cuda"):
         enable_depth=True,
         enable_alignment=False,
     )
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
+
+    # 支持传入目录路径（自动查找 .pt/.pth 文件）
+    ckpt_path = checkpoint_path
+    if os.path.isdir(ckpt_path):
+        candidates = [f for f in os.listdir(ckpt_path) if f.endswith(('.pt', '.pth'))]
+        if len(candidates) == 1:
+            ckpt_path = os.path.join(ckpt_path, candidates[0])
+        elif len(candidates) > 1:
+            raise ValueError(f"目录 {ckpt_path} 中有多个权重文件: {candidates}，请指定具体文件路径")
+        else:
+            raise FileNotFoundError(f"目录 {ckpt_path} 中未找到 .pt/.pth 文件")
+
+    state_dict = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(state_dict)
     model = model.eval().to(device)
     return model
