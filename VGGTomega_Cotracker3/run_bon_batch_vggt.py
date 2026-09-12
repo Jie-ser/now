@@ -5,7 +5,7 @@
 VGGT-Omega 和 CoTracker3 延迟加载，与 DiT 交替占用 GPU。
 
 用法：
-    python VGGT_Cotracker3/run_bon_batch_vggt.py \
+    python VGGTomega_Cotracker3/run_bon_batch_vggt.py \
         --start 1 --end 24 \
         --ckpt_dir /path/to/Wan2.2-I2V-A14B \
         --vggt_model /path/to/vggt_omega_checkpoint.pth \
@@ -35,8 +35,8 @@ import wan
 from wan.configs import MAX_AREA_CONFIGS, WAN_CONFIGS
 from wan.utils.utils import save_video
 
-from VGGT_Cotracker3.bon_pipeline_vggt import GeoRewardBoNVGGT
-from VGGT_Cotracker3.recon_reward_vggt import VGGTReconRewardConfig
+from VGGTomega_Cotracker3.bon_pipeline_vggt import GeoRewardBoNVGGT
+from VGGTomega_Cotracker3.recon_reward_vggt import VGGTReconRewardConfig
 
 
 logger = logging.getLogger(__name__)

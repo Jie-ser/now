@@ -2,7 +2,7 @@
 单条 Best-of-N CLI（VGGT-Omega + CoTracker3 后端）。
 
 用法：
-    python VGGT_Cotracker3/run_bon_vggt.py \
+    python VGGTomega_Cotracker3/run_bon_vggt.py \
         --ckpt_dir /path/to/Wan2.2-I2V-A14B \
         --vggt_model /path/to/vggt_omega_checkpoint.pth \
         --image /path/to/first_frame.png \
@@ -31,8 +31,8 @@ import wan
 from wan.configs import WAN_CONFIGS, MAX_AREA_CONFIGS
 from wan.utils.utils import save_video
 
-from VGGT_Cotracker3.bon_pipeline_vggt import GeoRewardBoNVGGT
-from VGGT_Cotracker3.recon_reward_vggt import VGGTReconRewardConfig
+from VGGTomega_Cotracker3.bon_pipeline_vggt import GeoRewardBoNVGGT
+from VGGTomega_Cotracker3.recon_reward_vggt import VGGTReconRewardConfig
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
