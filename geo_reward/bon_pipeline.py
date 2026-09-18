@@ -891,6 +891,7 @@ class GeoRewardBoNTreeBranching(GeoRewardBoNProgressiveV2):
                        output_dir, save_fn):
         """Tree Branching core logic."""
         t_start = time.time()
+        timing = {}
 
         branch_step = self.wan.find_step_for_sigma(state, self.branch_sigma)
         if branch_step is None:
@@ -909,16 +910,20 @@ class GeoRewardBoNTreeBranching(GeoRewardBoNProgressiveV2):
         print(f"[TreeBranching] Phase 1: Denoising {self.num_trunks} trunks "
               f"for {branch_step} steps...")
 
+        t_trunk = time.time()
         self.wan.denoise_candidates(state, trunk_indices, 0, branch_step)
+        timing["trunk_denoise_sec"] = time.time() - t_trunk
 
         # === Phase 2: Branching ===
         print(f"[TreeBranching] Phase 2: Branching {self.num_trunks} trunks "
               f"into {N} candidates (eta={self.branch_eta})...")
 
+        t_branch = time.time()
         state = self.wan.branch_candidates(
             state, trunk_indices, self.branches_per_trunk,
             self.branch_eta, branch_seeds
         )
+        timing["branching_sec"] = time.time() - t_branch
 
         # === Phase 3: Progressive elimination from branch_step ===
         print(f"[TreeBranching] Phase 3: Progressive elimination from "
@@ -926,16 +931,20 @@ class GeoRewardBoNTreeBranching(GeoRewardBoNProgressiveV2):
 
         return self._progressive_elimination(
             state, N, branch_seeds, frame_num, output_dir, save_fn,
-            start_step=branch_step, t_start=t_start
+            start_step=branch_step, t_start=t_start, timing=timing
         )
 
     def _progressive_elimination(self, state, N, seeds, frame_num,
-                                  output_dir, save_fn, start_step, t_start):
+                                  output_dir, save_fn, start_step, t_start,
+                                  timing=None):
         """
         Execute progressive elimination starting from start_step.
 
         Returns: (best_video, result_log, best_seed)
         """
+        if timing is None:
+            timing = {}
+        checkpoint_timings = []
         total_steps = len(state['timesteps'])
 
         checkpoint_steps = []
@@ -989,12 +998,17 @@ class GeoRewardBoNTreeBranching(GeoRewardBoNProgressiveV2):
             print(f"\n[TreeBranching] Phase: {phase_name} "
                   f"(steps {cur_step}->{end_step}, {len(alive)} alive)")
 
+            cp_timing = {"name": phase_name, "alive": len(alive)}
+
             # 1. Denoise to checkpoint
+            t_denoise = time.time()
             last_preds, pre_step_latents = self.wan.denoise_candidates(
                 state, alive, cur_step, end_step
             )
+            cp_timing["denoise_sec"] = time.time() - t_denoise
 
             # 2. VAE decode
+            t_decode = time.time()
             decoded_videos = {}
             for cand_idx in alive:
                 if is_final:
@@ -1009,14 +1023,17 @@ class GeoRewardBoNTreeBranching(GeoRewardBoNProgressiveV2):
                 decoded_videos[cand_idx] = video_tensor.cpu()
                 del latent_to_decode, video_tensor
                 torch.cuda.empty_cache()
+            cp_timing["vae_decode_sec"] = time.time() - t_decode
 
             # 3. Offload DiT + VAE, load 4RC
+            t_swap = time.time()
             if self.offload_models:
                 self._offload_dit()
                 self._offload_vae()
                 self._load_4rc()
 
             # 4. Score
+            t_reward = time.time()
             scored = []
             for cand_idx in alive:
                 seed = seeds[cand_idx]
@@ -1056,13 +1073,17 @@ class GeoRewardBoNTreeBranching(GeoRewardBoNProgressiveV2):
                 torch.cuda.empty_cache()
 
             del decoded_videos
+            cp_timing["reward_sec"] = time.time() - t_reward
 
             # 5. Offload 4RC, reload DiT + VAE
+            t_swap_back = time.time()
             if self.offload_models:
                 self._offload_4rc()
                 if not is_final:
                     self._load_dit()
                 self._load_vae()
+            cp_timing["model_swap_sec"] = (time.time() - t_swap_back) + (t_reward - t_swap)
+            checkpoint_timings.append(cp_timing)
 
             # 6. Eliminate
             if not is_final:
@@ -1092,6 +1113,9 @@ class GeoRewardBoNTreeBranching(GeoRewardBoNProgressiveV2):
             "branch_eta": self.branch_eta,
             "branch_step": start_step,
         }
+        timing["checkpoints"] = checkpoint_timings
+        timing["total_sec"] = elapsed
+        result_log["timing"] = timing
 
         print(f"\n[TreeBranching] Best: seed_{best_seed} "
               f"(total={best_final_score:.4f}) in {elapsed:.1f}s")
@@ -1194,7 +1218,8 @@ class GeoRewardBoNTreeBranchingGuided(GeoRewardBoNTreeBranching):
                     self._vae_restore_fn()
 
     def _progressive_elimination(self, state, N, seeds, frame_num,
-                                  output_dir, save_fn, start_step, t_start):
+                                  output_dir, save_fn, start_step, t_start,
+                                  timing=None):
         """
         Progressive elimination with gradient guidance.
 
@@ -1202,6 +1227,9 @@ class GeoRewardBoNTreeBranchingGuided(GeoRewardBoNTreeBranching):
         Guidance sigma window controls when guidance is active — steps with
         sigma > sigma_max are automatically skipped by should_guide().
         """
+        if timing is None:
+            timing = {}
+        checkpoint_timings = []
         total_steps = len(state['timesteps'])
 
         checkpoint_steps = []
@@ -1255,15 +1283,20 @@ class GeoRewardBoNTreeBranchingGuided(GeoRewardBoNTreeBranching):
             print(f"\n[TreeBranchingGuided] Phase: {phase_name} "
                   f"(steps {cur_step}->{end_step}, {len(alive)} alive)")
 
+            cp_timing = {"name": phase_name, "alive": len(alive)}
+
             # Denoise with guidance (sigma window auto-skips high-sigma phases)
+            t_denoise = time.time()
             last_preds, pre_step_latents = self.wan.denoise_candidates_with_guidance(
                 state, alive, cur_step, end_step,
                 guidance=self.guidance,
                 guidance_offload_dit=None,
                 guidance_reload_dit=None,
             )
+            cp_timing["denoise_sec"] = time.time() - t_denoise
 
             # VAE decode
+            t_decode = time.time()
             decoded_videos = {}
             vae_dev = getattr(self.guidance, 'vae_device', None)
             for cand_idx in alive:
@@ -1281,14 +1314,17 @@ class GeoRewardBoNTreeBranchingGuided(GeoRewardBoNTreeBranching):
                 decoded_videos[cand_idx] = video_tensor.cpu()
                 del latent_to_decode, video_tensor
                 torch.cuda.empty_cache()
+            cp_timing["vae_decode_sec"] = time.time() - t_decode
 
             # Offload DiT + VAE, load 4RC (only if single-GPU offload mode)
+            t_swap = time.time()
             if self.offload_models:
                 self._offload_dit()
                 self._offload_vae()
                 self._load_4rc()
 
             # Score
+            t_reward = time.time()
             scored = []
             for cand_idx in alive:
                 seed = seeds[cand_idx]
@@ -1328,13 +1364,17 @@ class GeoRewardBoNTreeBranchingGuided(GeoRewardBoNTreeBranching):
                 torch.cuda.empty_cache()
 
             del decoded_videos
+            cp_timing["reward_sec"] = time.time() - t_reward
 
             # Offload 4RC, reload DiT + VAE (only if single-GPU offload mode)
+            t_swap_back = time.time()
             if self.offload_models:
                 self._offload_4rc()
                 if not is_final:
                     self._load_dit()
                 self._load_vae()
+            cp_timing["model_swap_sec"] = (time.time() - t_swap_back) + (t_reward - t_swap)
+            checkpoint_timings.append(cp_timing)
 
             # Eliminate
             if not is_final:
@@ -1372,6 +1412,9 @@ class GeoRewardBoNTreeBranchingGuided(GeoRewardBoNTreeBranching):
             "sigma_max": self.guidance.cfg.sigma_max,
             "guidance_frames": self.guidance.guidance_frames,
         }
+        timing["checkpoints"] = checkpoint_timings
+        timing["total_sec"] = elapsed
+        result_log["timing"] = timing
 
         print(f"\n[TreeBranchingGuided] Best: seed_{best_seed} "
               f"(total={best_final_score:.4f}) in {elapsed:.1f}s")

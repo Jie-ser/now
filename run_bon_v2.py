@@ -595,6 +595,8 @@ def run_bon(args):
 
         candidates = []
         rewards = []
+        candidate_timings = []
+        t_total_start = time.time()
 
         # Set up guidance if enabled
         guidance_obj = None
@@ -769,11 +771,13 @@ def run_bon(args):
 
             candidates.append(video)
 
+            t_swap = time.time()
             if offload_models and not dual_gpu_guidance:
                 wan_i2v.low_noise_model.cpu()
                 wan_i2v.high_noise_model.cpu()
                 torch.cuda.empty_cache()
                 fourrc_model.cuda()
+            swap_to_reward_time = time.time() - t_swap
 
             frames_pil = wan_output_to_pil(video)
             sampled = [frames_pil[idx] for idx in indices if idx < len(frames_pil)]
@@ -783,23 +787,37 @@ def run_bon(args):
             reward_time = time.time() - t1
             rewards.append(r)
 
+            t_swap_back = time.time()
             if offload_models and not dual_gpu_guidance:
                 fourrc_model.cpu()
                 torch.cuda.empty_cache()
+            swap_back_time = time.time() - t_swap_back
+
+            candidate_timings.append({
+                "seed": seed,
+                "generate_sec": gen_time,
+                "model_swap_to_reward_sec": swap_to_reward_time,
+                "reward_sec": reward_time,
+                "model_swap_back_sec": swap_back_time,
+            })
 
             logger.info(f"  Candidate {i+1}/{args.N} (seed={seed}): "
                         f"total={r['total']:.4f} "
                         f"(R_static={r['R_static']:.4f}, R_dynamic={r['R_dynamic']:.4f}, "
                         f"R_motion={r['R_motion']:.4f}, G_anchor={r['G_anchor']:.2f}) "
-                        f"[gen={gen_time:.1f}s, reward={reward_time:.1f}s]")
+                        f"[gen={gen_time:.1f}s, swap={swap_to_reward_time:.1f}s, "
+                        f"reward={reward_time:.1f}s, swap_back={swap_back_time:.1f}s]")
 
         if not candidates:
             raise RuntimeError("No valid candidates generated.")
 
+        total_elapsed = time.time() - t_total_start
+
         import numpy as np
         best_idx = max(range(len(rewards)), key=lambda i: rewards[i]["total"])
         logger.info(f"\n[BoN V2] Selected candidate {best_idx+1}/{len(candidates)} "
-                    f"with reward {rewards[best_idx]['total']:.4f}")
+                    f"with reward {rewards[best_idx]['total']:.4f} "
+                    f"(total {total_elapsed:.1f}s)")
 
         os.makedirs(case_dir, exist_ok=True)
         ranked_indices = sorted(range(len(rewards)),
@@ -855,6 +873,23 @@ def run_bon(args):
                  "is_best": i == best_idx}
                 for rank, i in enumerate(ranked_indices)
             ],
+            "timing": {
+                "total_sec": total_elapsed,
+                "per_candidate": candidate_timings,
+                "avg_generate_sec": (
+                    sum(c["generate_sec"] for c in candidate_timings) / len(candidate_timings)
+                    if candidate_timings else 0.0
+                ),
+                "avg_reward_sec": (
+                    sum(c["reward_sec"] for c in candidate_timings) / len(candidate_timings)
+                    if candidate_timings else 0.0
+                ),
+                "avg_model_swap_sec": (
+                    sum(c["model_swap_to_reward_sec"] + c["model_swap_back_sec"]
+                        for c in candidate_timings) / len(candidate_timings)
+                    if candidate_timings else 0.0
+                ),
+            },
         }
         log_path = os.path.join(case_dir, "rewards.json")
         with open(log_path, "w", encoding="utf-8") as f:
